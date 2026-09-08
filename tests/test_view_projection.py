@@ -9,6 +9,7 @@ import pytest
 from _util import by_name, expr_of, model_of, parse
 from ossie_cube import ConversionError, IssueType, convert_cube_to_ossie
 
+import cube_databricks_metric_view_bridge.view_projection as view_projection
 from cube_databricks_metric_view_bridge import (
     convert_cube_view_to_databricks_metric_view,
     convert_cube_view_to_ossie,
@@ -244,6 +245,34 @@ def test_selected_geo_segment_and_split_projection_are_rejected():
     split = _MODEL.replace("- join_path: orders\n", "- join_path: orders\n        split: true\n")
     with pytest.raises(ConversionError, match="split view projections"):
         _project(split)
+
+
+@pytest.mark.parametrize("hidden_dependency", [False, True])
+def test_rolling_window_measures_are_rejected(hidden_dependency):
+    selected = "published" if hidden_dependency else "rolling_revenue"
+    calculated = (
+        '      - {name: published, sql: "{rolling_revenue}", type: number}\n'
+        if hidden_dependency
+        else ""
+    )
+    text = f"""
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    measures:
+      - name: rolling_revenue
+        sql: amount
+        type: sum
+        rolling_window:
+          trailing: 7 day
+{calculated}views:
+  - name: sales
+    cubes:
+      - {{join_path: orders, includes: [{selected}]}}
+"""
+
+    with pytest.raises(ConversionError, match="rolling_window"):
+        _project(text)
 
 
 def test_unselected_fanout_metric_does_not_block_publication():
@@ -570,6 +599,57 @@ views:
     assert by_name(metric_view["measures"])["max_ltv"]["expr"] == "MAX(users.ltv)"
 
 
+def test_qualified_reference_to_missing_known_cube_member_is_rejected():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    measures:
+      - {name: misspelled_name, sql: "{users.nmae}", type: max}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: name, sql: name, type: string}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [misspelled_name]}
+"""
+
+    with pytest.raises(ConversionError, match="does not match a dimension or measure"):
+        _project(text)
+
+
+def test_raw_joined_column_form_remains_allowed_without_member_metadata():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    measures:
+      - {name: max_external_score, sql: "{users}.external_score", type: max}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [max_external_score]}
+"""
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+
+    assert by_name(metric_view["measures"])["max_external_score"]["expr"] == (
+        "MAX(users.external_score)"
+    )
+
+
 def test_hidden_dependency_dataset_can_be_selected_as_source():
     text = """
 cubes:
@@ -748,6 +828,31 @@ views:
 
     with pytest.raises(ConversionError, match="multiple declared join paths"):
         _project(text)
+
+
+def test_unreachable_dependency_path_search_is_bounded(monkeypatch):
+    connected = [f"cube_{index}" for index in range(9)]
+    cubes = {
+        name: {
+            "joins": [{"name": other} for other in connected if other != name],
+        }
+        for name in connected
+    }
+    cubes["unreachable"] = {"joins": []}
+    calls = 0
+    original = view_projection._as_named_list
+
+    def bounded_named_list(value, label):
+        nonlocal calls
+        calls += 1
+        if calls > len(cubes):
+            raise AssertionError("path search revisited the dense unreachable component")
+        return original(value, label)
+
+    monkeypatch.setattr(view_projection, "_as_named_list", bounded_named_list)
+
+    assert view_projection._declared_join_paths(cubes, connected[0], "unreachable") == []
+    assert calls == len(cubes)
 
 
 def test_projection_converts_to_databricks_metric_view_without_member_collisions():

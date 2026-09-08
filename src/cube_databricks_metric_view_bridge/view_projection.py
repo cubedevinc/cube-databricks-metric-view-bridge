@@ -15,6 +15,7 @@ not accidentally publish private implementation members.
 import copy
 import dataclasses
 import re
+from collections import deque
 
 from ossie_cube._common import (
     _CUBE_REF_RE,
@@ -391,15 +392,15 @@ def _expand_dependency_graph(view_name, cubes, root, required, joins, dependency
     for target in sorted(dependency_cubes):
         if target in expanded_required:
             continue
-        paths = _declared_join_paths(cubes, root, target, limit=2)
+        paths = _declared_join_paths(cubes, root, target)
         if not paths:
             raise ConversionError(
-                f"view '{view_name}': selected measures depend on cube '{target}', "
+                f"view '{view_name}': selected members depend on cube '{target}', "
                 f"but it has no declared join path from view root '{root}'"
             )
         if len(paths) > 1:
             raise ConversionError(
-                f"view '{view_name}': selected measures depend on cube '{target}' through "
+                f"view '{view_name}': selected members depend on cube '{target}' through "
                 "multiple declared join paths; add an explicit view join_path to disambiguate it"
             )
         for left, right in zip(paths[0], paths[0][1:], strict=False):
@@ -415,29 +416,49 @@ def _expand_dependency_graph(view_name, cubes, root, required, joins, dependency
     return expanded_required, expanded_joins
 
 
-def _declared_join_paths(cubes, start, target, limit):
-    """Return up to ``limit`` simple paths following declared Cube joins."""
+def _declared_join_paths(cubes, start, target):
+    """Return one path, plus an alternative when the route is ambiguous.
 
-    found = []
+    Enumerating every simple path is factorial for a dense cyclic component,
+    especially when ``target`` is unreachable. A breadth-first reachability
+    pass finds one path in linear time. Any distinct path must omit at least one
+    edge from that first path, so repeating the bounded search with each of
+    those edges removed is sufficient to detect ambiguity in polynomial time.
+    """
 
-    def visit(current, path):
-        if len(found) >= limit:
-            return
-        joins = _as_named_list(cubes[current].get("joins"), f"cube '{current}' joins")
-        for join in joins:
-            neighbor = join.get("name")
-            if neighbor not in cubes or neighbor in path:
-                continue
-            next_path = path + [neighbor]
-            if neighbor == target:
-                found.append(next_path)
-            else:
-                visit(neighbor, next_path)
-            if len(found) >= limit:
-                return
+    adjacency = {}
+    for cube_name, cube in cubes.items():
+        adjacency[cube_name] = [
+            join.get("name")
+            for join in _as_named_list(cube.get("joins"), f"cube '{cube_name}' joins")
+            if join.get("name") in cubes
+        ]
 
-    visit(start, [start])
-    return found
+    def find_path(blocked_edge=None):
+        parents = {start: None}
+        queue = deque([start])
+        while queue:
+            current = queue.popleft()
+            for neighbor in adjacency.get(current, ()):
+                if (current, neighbor) == blocked_edge or neighbor in parents:
+                    continue
+                parents[neighbor] = current
+                if neighbor == target:
+                    path = [target]
+                    while parents[path[-1]] is not None:
+                        path.append(parents[path[-1]])
+                    return list(reversed(path))
+                queue.append(neighbor)
+        return None
+
+    first = find_path()
+    if first is None:
+        return []
+    for edge in zip(first, first[1:], strict=False):
+        alternative = find_path(edge)
+        if alternative is not None:
+            return [first, alternative]
+    return [first]
 
 
 def _measure_closure(cubes, initial):
@@ -452,6 +473,11 @@ def _measure_closure(cubes, initial):
         measure = measures.get((cube_name, measure_name))
         if measure is None:
             continue
+        if measure.get("rolling_window") is not None:
+            raise ConversionError(
+                f"measure '{cube_name}.{measure_name}' uses rolling_window, which has "
+                "no faithful Databricks Metric View publication form"
+            )
         for text in _measure_expression_texts(measure):
             for target in _member_references(text, cube_name, cubes):
                 if target in measures and target not in needed:
@@ -548,7 +574,24 @@ def _cube_references(text, own_cube, cubes):
             if not dot
             else (own_cube if head in ("CUBE", "TABLE", own_cube) else head, rest)
         )
+        if (
+            dot
+            and target[0] in cubes
+            and not _cube_has_member(cubes[target[0]], target[0], target[1])
+        ):
+            raise ConversionError(
+                f"reference '{{{body}}}' does not match a dimension or measure in "
+                f"cube '{target[0]}'; use '{{{target[0]}}}.{target[1]}' for a raw column"
+            )
         yield "member", target
+
+
+def _cube_has_member(cube, cube_name, member_name):
+    return any(
+        member.get("name") == member_name
+        for collection in ("dimensions", "measures")
+        for member in _as_named_list(cube.get(collection), f"cube '{cube_name}' {collection}")
+    )
 
 
 def _member_references(text, own_cube, cubes):

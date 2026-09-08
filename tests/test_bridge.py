@@ -15,6 +15,7 @@ from cube_databricks_metric_view_bridge import (
     ConversionResult,
     convert_cube_view_to_databricks_metric_view,
 )
+from cube_databricks_metric_view_bridge.bridge import _dataset_qualifiers
 
 _NESTED_MODEL = """
 cubes:
@@ -198,6 +199,32 @@ def test_source_override_that_drops_a_selected_member_fails_closed():
             "sales",
             source="customers",
         )
+
+
+@pytest.mark.parametrize(
+    "datasets, relationships",
+    [
+        (
+            ["orders", "users", "Users"],
+            [
+                {"from": "orders", "to": "users"},
+                {"from": "orders", "to": "Users"},
+            ],
+        ),
+        (
+            ["orders", "Source"],
+            [{"from": "orders", "to": "Source"}],
+        ),
+    ],
+)
+def test_case_insensitive_join_alias_collisions_fail_closed(datasets, relationships):
+    model = {
+        "datasets": [{"name": name} for name in datasets],
+        "relationships": relationships,
+    }
+
+    with pytest.raises(ConversionError, match="join alias.*case-insensitively"):
+        _dataset_qualifiers(model, "orders")
 
 
 def test_behavior_neutral_ossie_warnings_remain_visible_to_caller_policy():

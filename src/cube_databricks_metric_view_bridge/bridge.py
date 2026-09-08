@@ -204,6 +204,7 @@ def _dataset_qualifiers(model: dict, source: str) -> dict[str, str]:
         return {}
     paths: dict[str, tuple[str, ...]] = {source: ()}
     used_aliases = {"source"}
+    used_normalized_aliases = {"source"}
 
     def visit(parent):
         for child in adjacency[parent]:
@@ -215,7 +216,14 @@ def _dataset_qualifiers(model: dict, source: str) -> dict[str, str]:
             while alias in used_aliases:
                 alias = f"{base}_{suffix}"
                 suffix += 1
+            normalized_alias = alias.casefold()
+            if normalized_alias in used_normalized_aliases:
+                raise ConversionError(
+                    f"Databricks join alias '{alias}' collides case-insensitively with "
+                    "another join alias or the reserved 'source' alias"
+                )
             used_aliases.add(alias)
+            used_normalized_aliases.add(normalized_alias)
             paths[child] = paths[parent] + (alias,)
             visit(child)
 
