@@ -8,15 +8,14 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import re
-import threading
-import warnings
+from contextvars import ContextVar
 from typing import Literal
 
 import yaml
 from ossie import OSIDocument
 from ossie_cube import ConversionError
-from ossie_databricks import convert_ossie_to_metric_view
 from ossie_databricks._common import dump_yaml as dump_databricks_yaml
 from ossie_databricks._common import load_yaml as load_databricks_yaml
 from sqlglot import Dialect, exp, parse_one
@@ -51,11 +50,29 @@ _JOINED_COMPLEX_WARNING = re.compile(
     r"emitted as-is, verify qualification$"
 )
 
-# ``warnings.catch_warnings`` mutates process-global state on the oldest Python
-# runtime supported by this package. Keep the upstream conversion and capture in
-# one critical section so concurrent bridge calls cannot steal each other's
-# diagnostics.
-_CONVERTER_WARNING_LOCK = threading.Lock()
+# The pinned converter exposes diagnostics only through its private ``_warn``
+# function, which normally delegates to Python's process-global warnings state.
+# Route only those converter diagnostics into a call-local sink. Direct uses of
+# the upstream converter, and every unrelated warning, continue through the
+# original function unchanged.
+_databricks_converter = importlib.import_module("ossie_databricks.ossie_to_metric_view")
+convert_ossie_to_metric_view = _databricks_converter.convert_ossie_to_metric_view
+_original_databricks_warn = _databricks_converter._warn
+_converter_warning_sink: ContextVar[list[str] | None] = ContextVar(
+    "cube_bridge_databricks_warning_sink",
+    default=None,
+)
+
+
+def _route_databricks_warning(scope, message):
+    sink = _converter_warning_sink.get()
+    if sink is None:
+        return _original_databricks_warn(scope, message)
+    sink.append(f"[{scope}] {message}")
+    return None
+
+
+_databricks_converter._warn = _route_databricks_warning
 
 
 def convert_cube_view_to_databricks_metric_view(
@@ -83,13 +100,15 @@ def convert_cube_view_to_databricks_metric_view(
     document = yaml.safe_load(projected)
     normalized = OSIDocument.model_validate(document).to_osi_yaml()
 
-    with _CONVERTER_WARNING_LOCK:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            metric_view_yaml = convert_ossie_to_metric_view(
-                normalized,
-                source=resolved_source,
-            )
+    caught: list[str] = []
+    warning_token = _converter_warning_sink.set(caught)
+    try:
+        metric_view_yaml = convert_ossie_to_metric_view(
+            normalized,
+            source=resolved_source,
+        )
+    finally:
+        _converter_warning_sink.reset(warning_token)
 
     metric_view_yaml, qualified_fields = _qualify_joined_computed_dimensions(
         normalized,
@@ -105,9 +124,9 @@ def convert_cube_view_to_databricks_metric_view(
     )
     _validate_public_surface(normalized, metric_view_yaml)
     unhandled_warnings = [
-        str(item.message)
-        for item in caught
-        if not _is_handled_joined_expression_warning(str(item.message), qualified_fields)
+        message
+        for message in caught
+        if not _is_handled_joined_expression_warning(message, qualified_fields)
     ]
     unsafe_dimensions = [
         message for message in unhandled_warnings if _JOINED_COMPLEX_WARNING.fullmatch(message)

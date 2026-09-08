@@ -97,7 +97,9 @@ The bridge currently uses explicitly isolated private converter primitives becau
 the upstream Cube converter does not yet expose a view-projection API. That coupling
 is contained within this package and covered by integration tests. Once a suitable
 public API is accepted upstream, the bridge can change internally without changing
-its public result contract.
+its public result contract. The pinned Databricks converter also exposes diagnostics
+only through a private warning hook; the bridge routes that hook into a context-local
+sink so it does not capture or suppress unrelated process warnings.
 
 ## Development
 

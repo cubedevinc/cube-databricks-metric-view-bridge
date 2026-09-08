@@ -7,7 +7,7 @@
 
 import dataclasses
 import threading
-import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -368,33 +368,62 @@ def test_conversion_is_deterministic_and_result_is_immutable():
         raise AssertionError("ConversionResult must remain immutable")
 
 
-def test_concurrent_conversions_serialize_upstream_warning_capture(monkeypatch):
+def test_concurrent_conversions_keep_upstream_diagnostics_call_local(monkeypatch):
     original = bridge_module.convert_ossie_to_metric_view
-    state_lock = threading.Lock()
-    active_calls = 0
-    maximum_active_calls = 0
-
-    def tracked_converter(*args, **kwargs):
-        nonlocal active_calls, maximum_active_calls
-        with state_lock:
-            active_calls += 1
-            maximum_active_calls = max(maximum_active_calls, active_calls)
-        try:
-            time.sleep(0.02)
-            return original(*args, **kwargs)
-        finally:
-            with state_lock:
-                active_calls -= 1
-
-    monkeypatch.setattr(bridge_module, "convert_ossie_to_metric_view", tracked_converter)
     start = threading.Barrier(4)
 
-    def convert_after_barrier(_):
+    def synchronized_converter(*args, **kwargs):
         start.wait()
-        return _convert()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(bridge_module, "convert_ossie_to_metric_view", synchronized_converter)
+
+    def convert(index):
+        dataset = f"orders_{index}"
+        model = f"""
+cubes:
+  - name: {dataset}
+    sql_table: main.sales.{dataset}
+    dimensions:
+      - {{name: id, sql: id, type: number, primary_key: true}}
+views:
+  - name: sales
+    cubes:
+      - {{join_path: {dataset}, includes: [id]}}
+"""
+        return convert_cube_view_to_databricks_metric_view({"model.yml": model}, "sales")
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        results = list(executor.map(convert_after_barrier, range(4)))
+        results = list(executor.map(convert, range(4)))
 
-    assert len(results) == 4
-    assert maximum_active_calls == 1
+    for index, result in enumerate(results):
+        messages = [issue.message for issue in result.issues if issue.origin == "ossie_databricks"]
+        assert any(f"dataset 'orders_{index}'" in message for message in messages)
+        assert not any(
+            f"dataset 'orders_{other}'" in message
+            for other in range(4)
+            if other != index
+            for message in messages
+        )
+
+
+def test_unrelated_warnings_are_not_swallowed_or_mislabeled(monkeypatch):
+    original = bridge_module.convert_ossie_to_metric_view
+
+    def noisy_converter(*args, **kwargs):
+        thread = threading.Thread(
+            target=warnings.warn,
+            args=("unrelated application warning",),
+            kwargs={"stacklevel": 2},
+        )
+        thread.start()
+        thread.join()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(bridge_module, "convert_ossie_to_metric_view", noisy_converter)
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        result = _convert()
+
+    assert [str(item.message) for item in emitted] == ["unrelated application warning"]
+    assert not any("unrelated application warning" in issue.message for issue in result.issues)
