@@ -490,6 +490,24 @@ def _measure_closure(cubes, initial):
                 f"measure '{cube_name}.{measure_name}' uses rolling_window, which has "
                 "no faithful Databricks Metric View publication form"
             )
+        unsupported_multi_stage = [
+            property_name
+            for property_name in (
+                "multi_stage",
+                "group_by",
+                "reduce_by",
+                "add_group_by",
+                "time_shift",
+            )
+            if measure.get(property_name) is not None
+        ]
+        if unsupported_multi_stage:
+            properties = ", ".join(unsupported_multi_stage)
+            raise ConversionError(
+                f"measure '{cube_name}.{measure_name}' uses unsupported Cube multi-stage "
+                f"properties ({properties}), which have no faithful Databricks Metric View "
+                "publication form"
+            )
         for text in _measure_expression_texts(measure):
             for target in _member_references(text, cube_name, cubes):
                 if target in measures and target not in needed:

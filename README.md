@@ -29,11 +29,13 @@ public Metric View members.
 
 Publication is deliberately conservative. It rejects ambiguous/multi-root view
 graphs, split views, name collisions, and selected members without a faithful
-static form. Fan-out-unsafe metrics are rejected by default. Metric expressions
-must be statically parseable without nested query or lambda binding scopes so the
-bridge can prove the source dataset of every physical column. Joined-dataset
-references retain their Cube reference provenance; a physical multipart column is
-never inferred to be a join merely because its first component matches a cube name.
+static form. Fan-out-unsafe metrics are rejected by default. Rolling-window and
+multi-stage measure properties are rejected until they can be lowered without
+changing grain or time-shift semantics. Metric expressions must be statically
+parseable without nested query or lambda binding scopes so the bridge can prove the
+source dataset of every physical column. Joined-dataset references retain their
+Cube reference provenance; a physical multipart column is never inferred to be a
+join merely because its first component matches a cube name.
 Source-owned fields and metric columns use Databricks' explicit `source` qualifier,
 so a source struct path cannot be mistaken for a same-named emitted join.
 

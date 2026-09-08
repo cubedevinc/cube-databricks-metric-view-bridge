@@ -295,6 +295,50 @@ cubes:
         _project(text)
 
 
+@pytest.mark.parametrize("hidden_dependency", [False, True])
+@pytest.mark.parametrize(
+    ("property_name", "property_value"),
+    [
+        ("multi_stage", "true"),
+        ("group_by", "[status]"),
+        ("reduce_by", "[status]"),
+        ("add_group_by", "[status]"),
+        (
+            "time_shift",
+            "[{time_dimension: created_at, interval: 1 day, type: prior}]",
+        ),
+    ],
+)
+def test_multi_stage_measure_semantics_are_rejected(
+    hidden_dependency,
+    property_name,
+    property_value,
+):
+    selected = "published" if hidden_dependency else "staged_revenue"
+    calculated = (
+        '      - {name: published, sql: "{staged_revenue}", type: number}\n'
+        if hidden_dependency
+        else ""
+    )
+    text = f"""
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    measures:
+      - name: staged_revenue
+        sql: amount
+        type: sum
+        {property_name}: {property_value}
+{calculated}views:
+  - name: sales
+    cubes:
+      - {{join_path: orders, includes: [{selected}]}}
+"""
+
+    with pytest.raises(ConversionError, match=property_name):
+        _project(text)
+
+
 def test_unselected_fanout_metric_does_not_block_publication():
     out, _, issues = _project()
     assert "lifetime_value" not in set(by_name(model_of(out).get("metrics")))
