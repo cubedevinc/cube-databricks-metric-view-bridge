@@ -19,7 +19,7 @@ from ossie_databricks import convert_ossie_to_metric_view
 from ossie_databricks._common import dump_yaml as dump_databricks_yaml
 from ossie_databricks._common import load_yaml as load_databricks_yaml
 from sqlglot import exp, parse_one
-from sqlglot.errors import ParseError
+from sqlglot.errors import SqlglotError
 
 from .view_projection import convert_cube_view_to_ossie
 
@@ -214,13 +214,18 @@ def _qualify_bare_columns(expression: str, qualifier: str) -> str | None:
         for column in list(tree.find_all(exp.Column)):
             if column.table:
                 continue
-            replacement = parse_one(
-                ".".join(prefix + [column.name]),
-                read="databricks",
+            # Reusing the parsed identifier is important: reconstructing this path
+            # from ``column.name`` drops quoting and can turn `` `first name` ``
+            # into an alias expression or `` `x-y` `` into subtraction.
+            replacement = exp.Dot.build(
+                [
+                    *(exp.to_identifier(part) for part in prefix),
+                    column.this.copy(),
+                ]
             )
             column.replace(replacement)
         return tree.sql(dialect="databricks")
-    except ParseError:
+    except SqlglotError:
         return None
 
 

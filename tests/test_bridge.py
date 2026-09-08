@@ -82,6 +82,29 @@ def test_nested_computed_dimension_uses_full_metric_view_join_path():
     assert not any("complex expression on a joined table" in item.message for item in result.issues)
 
 
+def test_joined_expression_preserves_quoted_physical_column_identifiers():
+    model = _NESTED_MODEL.replace(
+        "      - name: display_name\n"
+        "        sql: \"CONCAT({name}, ' (', {code}, ')')\"\n"
+        "        type: string",
+        "      - name: display_name\n"
+        "        sql: \"CASE WHEN `order` > 1 THEN CONCAT(`first name`, ' ', `last name`) "
+        "ELSE `x-y` END\"\n"
+        "        type: string",
+    )
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert expressions["display_name"] == (
+        "CASE WHEN customers.countries.`order` > 1 "
+        "THEN CONCAT(customers.countries.`first name`, ' ', "
+        "customers.countries.`last name`) ELSE customers.countries.`x-y` END"
+    )
+    assert not any("complex expression on a joined table" in item.message for item in result.issues)
+
+
 def test_behavior_neutral_ossie_warnings_remain_visible_to_caller_policy():
     result = _convert()
 
