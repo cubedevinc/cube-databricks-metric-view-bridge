@@ -215,6 +215,26 @@ def test_case_insensitive_output_collision_is_rejected():
         _project(text)
 
 
+@pytest.mark.parametrize("yaml_value", ["''", "0", "false", "null"])
+@pytest.mark.parametrize("alias_kind", ["cube", "member"])
+def test_falsy_or_non_string_aliases_are_rejected(yaml_value, alias_kind):
+    target = "alias: customer" if alias_kind == "cube" else "alias: name"
+    text = _MODEL.replace(target, f"alias: {yaml_value}")
+
+    with pytest.raises(ConversionError, match="alias.*non-empty string"):
+        _project(text)
+
+
+def test_unknown_exclusion_is_rejected_before_wildcard_publication():
+    text = _MODEL.replace(
+        "includes:\n          - status\n          - average_value",
+        "includes: '*'\n        excludes: [average_vlaue]",
+    )
+
+    with pytest.raises(ConversionError, match="excluded member.*does not exist"):
+        _project(text)
+
+
 def test_missing_join_in_join_path_is_rejected():
     text = _MODEL.replace("joins:\n      - name: users", "joins_disabled:\n      - name: users")
     with pytest.raises(ConversionError, match="declares no join"):
@@ -566,6 +586,29 @@ views:
     assert by_name(metric_view["measures"])["struct_total"]["expr"] == ("MAX(accounts.balance)")
     assert by_name(metric_view["measures"])["joined_total"]["expr"] == (
         "MAX(users.accounts.balance)"
+    )
+
+
+def test_physical_path_cannot_impersonate_a_provenance_marker_by_case():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    measures:
+      - name: max_external_value
+        sql: __CUBE_DMV_DATASET_0__.value
+        type: max
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [max_external_value]}
+"""
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+
+    assert by_name(metric_view["measures"])["max_external_value"]["expr"] == (
+        "MAX(__CUBE_DMV_DATASET_0__.value)"
     )
 
 

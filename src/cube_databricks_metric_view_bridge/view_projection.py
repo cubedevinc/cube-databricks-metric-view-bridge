@@ -265,9 +265,11 @@ def _members_from_entry(view_name, entry, cube_name, cube):
     prefix = entry.get("prefix", False)
     if not isinstance(prefix, bool):
         raise ConversionError(f"view '{view_name}': prefix for cube '{cube_name}' must be boolean")
-    alias = entry.get("alias") or cube_name
-    if not isinstance(alias, str):
-        raise ConversionError(f"view '{view_name}': alias for cube '{cube_name}' must be a string")
+    alias = entry["alias"] if "alias" in entry else cube_name
+    if not isinstance(alias, str) or not alias:
+        raise ConversionError(
+            f"view '{view_name}': alias for cube '{cube_name}' must be a non-empty string"
+        )
 
     collections = {
         kind: {
@@ -292,14 +294,15 @@ def _members_from_entry(view_name, entry, cube_name, cube):
                 source_name, output_name, override = include, include, {}
             elif isinstance(include, dict):
                 source_name = include.get("name")
-                output_name = include.get("alias") or source_name
+                output_name = include["alias"] if "alias" in include else source_name
                 if not isinstance(source_name, str) or not source_name:
                     raise ConversionError(
                         f"view '{view_name}': include for cube '{cube_name}' must name a member"
                     )
-                if not isinstance(output_name, str):
+                if not isinstance(output_name, str) or not output_name:
                     raise ConversionError(
-                        f"view '{view_name}': alias for member '{source_name}' must be a string"
+                        f"view '{view_name}': alias for member '{source_name}' must be a "
+                        "non-empty string"
                     )
                 override = include
             else:
@@ -317,10 +320,19 @@ def _members_from_entry(view_name, entry, cube_name, cube):
             f"view '{view_name}': includes for cube '{cube_name}' must be '*' or a list"
         )
 
-    excludes = entry.get("excludes") or []
+    excludes = entry.get("excludes")
+    if excludes is None:
+        excludes = []
     if not isinstance(excludes, list) or not all(isinstance(v, str) for v in excludes):
         raise ConversionError(
             f"view '{view_name}': excludes for cube '{cube_name}' must be a list of member names"
+        )
+    known_members = {name for members in collections.values() for name in members}
+    unknown_excludes = [name for name in excludes if name not in known_members]
+    if unknown_excludes:
+        raise ConversionError(
+            f"view '{view_name}': excluded member '{cube_name}.{unknown_excludes[0]}' "
+            "does not exist"
         )
     out = []
     for source_name, output_name, override in requested:
@@ -602,7 +614,7 @@ def _member_references(text, own_cube, cubes):
 
 def _dataset_markers(cubes):
     base = "__cube_dmv_dataset_"
-    corpus = repr(cubes)
+    corpus = repr(cubes).casefold()
     while base in corpus:
         base = "_" + base
     return {cube_name: f"{base}{index}__" for index, cube_name in enumerate(cubes)}
