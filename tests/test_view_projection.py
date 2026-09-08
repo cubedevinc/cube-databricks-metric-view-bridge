@@ -212,6 +212,63 @@ def test_hidden_computed_dimensions_are_inlined_in_fields_and_metrics():
     assert "orders.net_amount" not in expr_of(metric)
 
 
+def test_case_dimensions_render_sql_labels_with_source_and_join_provenance():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: user_id, sql: user_id, type: number}
+      - {name: status, sql: status_code, type: string}
+      - {name: preferred_label, sql: preferred_label, type: string}
+      - {name: default_label, sql: default_label, type: string}
+      - name: source_segment
+        type: string
+        case:
+          when:
+            - sql: "{status} = 'vip'"
+              label: {sql: "{preferred_label}"}
+          else:
+            label: {sql: "{default_label}"}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: tier, sql: tier_code, type: string}
+      - {name: preferred_label, sql: preferred_label, type: string}
+      - {name: default_label, sql: default_label, type: string}
+      - name: joined_segment
+        type: string
+        case:
+          when:
+            - sql: "{tier} = 'vip'"
+              label: {sql: "{preferred_label}"}
+          else:
+            label: {sql: "{default_label}"}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [source_segment]}
+      - {join_path: orders.users, includes: [joined_segment]}
+"""
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    dimensions = by_name(metric_view["dimensions"])
+
+    assert dimensions["source_segment"]["expr"] == (
+        "CASE WHEN source.status_code = 'vip' THEN source.preferred_label "
+        "ELSE source.default_label END"
+    )
+    assert dimensions["joined_segment"]["expr"] == (
+        "CASE WHEN users.tier_code = 'vip' THEN users.preferred_label "
+        "ELSE users.default_label END"
+    )
+
+
 def test_wildcard_and_excludes_follow_cube_view_semantics():
     text = _MODEL.replace(
         "includes:\n          - status\n          - average_value",
