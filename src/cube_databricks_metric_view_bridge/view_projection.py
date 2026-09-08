@@ -87,19 +87,17 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
 
     needed_measures = _measure_closure(
         cubes,
-        {
-            (member.cube, member.source_name)
-            for member in selected
-            if member.kind == "measure"
-        },
+        {(member.cube, member.source_name) for member in selected if member.kind == "measure"},
     )
-    required_cubes, joins = _expand_measure_dependency_graph(
+    needed_dimensions = _measure_dimension_closure(cubes, needed_measures)
+    dependency_cubes = {cube_name for cube_name, _ in needed_measures | needed_dimensions}
+    required_cubes, joins = _expand_dependency_graph(
         view,
         cubes,
         paths[0][0],
         required_cubes,
         joins,
-        needed_measures,
+        dependency_cubes,
     )
     projected_cubes = _project_cubes(cubes, required_cubes, joins, needed_measures)
     synthetic = dump_yaml(
@@ -355,20 +353,15 @@ def _project_cubes(cubes, required, joins, needed_measures):
     return projected
 
 
-def _expand_measure_dependency_graph(
-    view_name, cubes, root, required, joins, needed_measures
-):
-    """Add uniquely reachable cubes needed only by hidden measure dependencies."""
+def _expand_dependency_graph(view_name, cubes, root, required, joins, dependency_cubes):
+    """Add uniquely reachable cubes needed by hidden member dependencies."""
 
     expanded_required = list(required)
     expanded_joins = {cube_name: dict(targets) for cube_name, targets in joins.items()}
     parent_of = {
-        target: cube_name
-        for cube_name, targets in expanded_joins.items()
-        for target in targets
+        target: cube_name for cube_name, targets in expanded_joins.items() for target in targets
     }
-    dependency_cubes = sorted({cube_name for cube_name, _ in needed_measures})
-    for target in dependency_cubes:
+    for target in sorted(dependency_cubes):
         if target in expanded_required:
             continue
         paths = _declared_join_paths(cubes, root, target, limit=2)
@@ -432,23 +425,81 @@ def _measure_closure(cubes, initial):
         measure = measures.get((cube_name, measure_name))
         if measure is None:
             continue
-        texts = [measure.get("sql")]
-        texts.extend(f.get("sql") for f in measure.get("filters") or [] if isinstance(f, dict))
-        for text in texts:
-            if not isinstance(text, str):
-                continue
-            for match in _CUBE_REF_RE.finditer(text):
-                body = match.group(1).strip()
-                head, dot, rest = body.partition(".")
-                target = (
-                    (cube_name, body)
-                    if not dot
-                    else (cube_name if head in ("CUBE", "TABLE") else head, rest)
-                )
+        for text in _measure_expression_texts(measure):
+            for target in _member_references(text, cube_name):
                 if target in measures and target not in needed:
                     needed.add(target)
                     queue.append(target)
     return needed
+
+
+def _measure_dimension_closure(cubes, needed_measures):
+    """Find dimensions read directly or transitively by selected measures."""
+
+    measures = {}
+    dimensions = {}
+    for cube_name, cube in cubes.items():
+        for measure in _as_named_list(cube.get("measures"), f"cube '{cube_name}' measures"):
+            measures[(cube_name, measure.get("name"))] = measure
+        for dimension in _as_named_list(cube.get("dimensions"), f"cube '{cube_name}' dimensions"):
+            dimensions[(cube_name, dimension.get("name"))] = dimension
+
+    needed = set()
+    queue = []
+    for cube_name, measure_name in needed_measures:
+        measure = measures.get((cube_name, measure_name))
+        if measure is None:
+            continue
+        for text in _measure_expression_texts(measure):
+            for target in _member_references(text, cube_name):
+                if target in dimensions and target not in needed:
+                    needed.add(target)
+                    queue.append(target)
+
+    while queue:
+        cube_name, dimension_name = queue.pop()
+        dimension = dimensions[(cube_name, dimension_name)]
+        for text in _dimension_expression_texts(dimension):
+            for target in _member_references(text, cube_name):
+                if target in dimensions and target not in needed:
+                    needed.add(target)
+                    queue.append(target)
+    return needed
+
+
+def _measure_expression_texts(measure):
+    texts = [measure.get("sql")]
+    texts.extend(f.get("sql") for f in measure.get("filters") or [] if isinstance(f, dict))
+    return (text for text in texts if isinstance(text, str))
+
+
+def _dimension_expression_texts(dimension):
+    sql = dimension.get("sql")
+    if isinstance(sql, str):
+        yield sql
+    case = dimension.get("case")
+    if not isinstance(case, dict):
+        return
+    holders = [item for item in case.get("when") or [] if isinstance(item, dict)]
+    otherwise = case.get("else")
+    if isinstance(otherwise, dict):
+        holders.append(otherwise)
+    for holder in holders:
+        condition = holder.get("sql")
+        if isinstance(condition, str):
+            yield condition
+        label = holder.get("label")
+        if isinstance(label, dict) and isinstance(label.get("sql"), str):
+            yield label["sql"]
+
+
+def _member_references(text, own_cube):
+    for match in _CUBE_REF_RE.finditer(text):
+        body = match.group(1).strip()
+        head, dot, rest = body.partition(".")
+        yield (
+            (own_cube, body) if not dot else (own_cube if head in ("CUBE", "TABLE") else head, rest)
+        )
 
 
 class _DimensionResolver:
@@ -702,9 +753,7 @@ def _publication_issues(collection, conversion, selected, required):
             # their transitive dependencies. A dependency-level fan-out issue is
             # therefore part of a selected measure's safety contract even though
             # the dependency itself is not exposed as a public metric.
-            dependency_fanout = (
-                is_conversion and issue.issue_type == IssueType.FANOUT_UNSAFE_METRIC
-            )
+            dependency_fanout = is_conversion and issue.issue_type == IssueType.FANOUT_UNSAFE_METRIC
             if member_issue or cube_issue or join_issue or dependency_fanout:
                 out.issues.append(issue)
     return out

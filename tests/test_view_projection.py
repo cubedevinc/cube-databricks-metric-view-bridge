@@ -267,14 +267,12 @@ def test_selected_fanout_metric_is_strict_by_default_and_reported_when_relaxed()
 
 def test_hidden_unsafe_measure_dependency_is_retained_and_blocks_strict_publication():
     text = _MODEL.replace(
+        '      - name: average_value\n        sql: "{revenue} / {count}"\n        type: number',
         "      - name: average_value\n"
-        "        sql: \"{revenue} / {count}\"\n"
-        "        type: number",
-        "      - name: average_value\n"
-        "        sql: \"{revenue} / {count}\"\n"
+        '        sql: "{revenue} / {count}"\n'
         "        type: number\n"
         "      - name: risky_value\n"
-        "        sql: \"{users.lifetime_value} / {count}\"\n"
+        '        sql: "{users.lifetime_value} / {count}"\n'
         "        type: number",
     ).replace(
         "          - status\n          - average_value",
@@ -285,9 +283,7 @@ def test_hidden_unsafe_measure_dependency_is_retained_and_blocks_strict_publicat
         _project(text)
 
     _, _, issues = _project(text, strict_fanout=False)
-    unsafe_elements = {
-        item.element_name for item in issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)
-    }
+    unsafe_elements = {item.element_name for item in issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)}
     assert unsafe_elements == {"orders.risky_value", "users.lifetime_value"}
 
 
@@ -353,9 +349,98 @@ views:
     assert metric_view["source"] == "main.sales.orders"
     assert metric_view["joins"][0]["name"] == "users"
     assert metric_view["joins"][0]["joins"][0]["name"] == "accounts"
-    assert by_name(metric_view["measures"])["customer_value"]["expr"] == (
-        "MAX(users.accounts.ltv)"
+    assert by_name(metric_view["measures"])["customer_value"]["expr"] == ("MAX(users.accounts.ltv)")
+
+
+def test_measure_dimension_dependencies_add_transitive_cubes_and_joins():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - name: users
+        sql: "{CUBE}.user_id = {users}.id"
+        relationship: many_to_one
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: user_id, sql: user_id, type: number}
+    measures:
+      - name: max_adjusted_score
+        sql: "{users.adjusted_score}"
+        type: max
+  - name: users
+    sql_table: main.sales.users
+    joins:
+      - name: profiles
+        sql: "{CUBE}.profile_id = {profiles}.id"
+        relationship: many_to_one
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: profile_id, sql: profile_id, type: number}
+      - {name: multiplier, sql: multiplier, type: number}
+      - name: adjusted_score
+        sql: "{profiles.base_score} * {multiplier}"
+        type: number
+  - name: profiles
+    sql_table: main.sales.profiles
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: base_score, sql: base_score, type: number}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [max_adjusted_score]}
+"""
+
+    out, source, issues = _project(text)
+    model = model_of(out)
+
+    assert source == "orders"
+    assert not list(issues)
+    assert set(by_name(model["datasets"])) == {"orders", "users", "profiles"}
+    assert [(item["from"], item["to"]) for item in model["relationships"]] == [
+        ("orders", "users"),
+        ("users", "profiles"),
+    ]
+    assert expr_of(by_name(model["metrics"])["max_adjusted_score"]) == (
+        "MAX((profiles.base_score * users.multiplier))"
     )
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert metric_view["joins"][0]["name"] == "users"
+    assert metric_view["joins"][0]["joins"][0]["name"] == "profiles"
+    assert by_name(metric_view["measures"])["max_adjusted_score"]["expr"] == (
+        "MAX((users.profiles.base_score * users.multiplier))"
+    )
+
+
+def test_implicit_dimension_dependency_rejects_ambiguous_join_paths():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+      - {name: accounts, sql: "{CUBE}.account_id = {accounts}.id", relationship: many_to_one}
+    measures:
+      - {name: value, sql: "{accounts.adjusted_value}", type: max}
+  - name: users
+    sql_table: main.sales.users
+    joins:
+      - {name: accounts, sql: "{CUBE}.account_id = {accounts}.id", relationship: many_to_one}
+  - name: accounts
+    sql_table: main.sales.accounts
+    dimensions:
+      - {name: adjusted_value, sql: value * 2, type: number}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [value]}
+"""
+
+    with pytest.raises(ConversionError, match="multiple declared join paths"):
+        _project(text)
 
 
 def test_implicit_measure_dependency_rejects_ambiguous_join_paths():

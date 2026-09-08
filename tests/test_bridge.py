@@ -9,7 +9,9 @@ import dataclasses
 
 import pytest
 import yaml
+from ossie_cube import ConversionError
 
+import cube_databricks_metric_view_bridge.bridge as bridge_module
 from cube_databricks_metric_view_bridge import (
     ConversionResult,
     convert_cube_view_to_databricks_metric_view,
@@ -90,7 +92,7 @@ def test_joined_expression_preserves_quoted_physical_column_identifiers():
         "        type: string",
         "      - name: display_name\n"
         "        sql: \"CASE WHEN `order` > 1 THEN CONCAT(`first name`, ' ', `last name`) "
-        "ELSE `x-y` END\"\n"
+        'ELSE `x-y` END"\n'
         "        type: string",
     )
 
@@ -192,6 +194,19 @@ def test_unparseable_joined_expression_is_not_silently_claimed_as_fixed():
     result = _convert(model)
 
     assert any("complex expression on a joined table" in item.message for item in result.issues)
+
+
+def test_unsafe_nested_metric_qualification_returns_no_publishable_artifact(monkeypatch):
+    original = bridge_module._qualify_nested_metric_references
+
+    def report_unsafe(ossie_yaml, metric_view_yaml, source):
+        rewritten, _ = original(ossie_yaml, metric_view_yaml, source)
+        return rewritten, ("unsafe_metric",)
+
+    monkeypatch.setattr(bridge_module, "_qualify_nested_metric_references", report_unsafe)
+
+    with pytest.raises(ConversionError, match="refusing to return a publishable"):
+        _convert()
 
 
 def test_conversion_is_deterministic_and_result_is_immutable():

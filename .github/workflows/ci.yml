@@ -25,3 +25,4 @@ jobs:
       - run: uv sync --locked --python ${{ matrix.python-version }}
       - run: uv run --python ${{ matrix.python-version }} ruff check .
       - run: uv run --python ${{ matrix.python-version }} pytest
+      - run: uv build

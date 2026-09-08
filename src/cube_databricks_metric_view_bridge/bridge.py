@@ -15,6 +15,7 @@ from typing import Literal
 
 import yaml
 from ossie import OSIDocument
+from ossie_cube import ConversionError
 from ossie_databricks import convert_ossie_to_metric_view
 from ossie_databricks._common import dump_yaml as dump_databricks_yaml
 from ossie_databricks._common import load_yaml as load_databricks_yaml
@@ -91,6 +92,12 @@ def convert_cube_view_to_databricks_metric_view(
         metric_view_yaml,
         resolved_source,
     )
+    if unsafe_metric_qualifications:
+        names = ", ".join(repr(name) for name in unsafe_metric_qualifications)
+        raise ConversionError(
+            "nested joined-dataset references could not be safely qualified for "
+            f"metric(s) {names}; refusing to return a publishable Metric View artifact"
+        )
     unhandled_warnings = [
         str(item.message)
         for item in caught
@@ -111,17 +118,6 @@ def convert_cube_view_to_databricks_metric_view(
             message=message,
         )
         for message in unhandled_warnings
-    ) + tuple(
-        BridgeIssue(
-            origin="ossie_databricks",
-            code="DATABRICKS_METRIC_JOIN_QUALIFICATION_UNSAFE",
-            message=(
-                f"Metric '{name}' references a nested joined dataset, but its expression "
-                "could not be safely join-qualified; publication must fail closed."
-            ),
-            element=name,
-        )
-        for name in unsafe_metric_qualifications
     )
     return ConversionResult(
         ossie_yaml=normalized,
@@ -333,8 +329,7 @@ def _qualify_bare_columns(
             return expression
         normalized_prefix = tuple(part.casefold() for part in prefix)
         normalized_known = {
-            tuple(part.casefold() for part in item.split(".") if part)
-            for item in known_qualifiers
+            tuple(part.casefold() for part in item.split(".") if part) for item in known_qualifiers
         }
         for column in list(tree.find_all(exp.Column)):
             target, parts = _complete_column_path(column)
@@ -344,9 +339,7 @@ def _qualify_bare_columns(
             if normalized_parts[: len(normalized_prefix)] == normalized_prefix:
                 continue
             if any(
-                path
-                and path != normalized_prefix
-                and normalized_parts[: len(path)] == path
+                path and path != normalized_prefix and normalized_parts[: len(path)] == path
                 for path in normalized_known
             ):
                 return None
