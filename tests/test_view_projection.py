@@ -547,6 +547,33 @@ views:
     assert by_name(metric_view["measures"])["total"]["expr"] == "SUM(amount)"
 
 
+def test_local_dimension_reference_is_not_shadowed_by_same_named_cube():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    dimensions:
+      - {name: users, sql: customer_name, type: string}
+      - {name: display_name, sql: "UPPER({users})", type: string}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [display_name]}
+      - {join_path: orders.users, includes: []}
+"""
+
+    out, _, _ = _project(text)
+    orders = by_name(model_of(out)["datasets"])["orders"]
+
+    assert expr_of(by_name(orders["fields"])["display_name"]) == "UPPER(customer_name)"
+
+
 def test_raw_physical_path_is_not_rewritten_as_a_nested_dataset_reference():
     text = """
 cubes:
@@ -680,6 +707,24 @@ views:
 """
 
     with pytest.raises(ConversionError, match="unknown cube qualifier 'usres'"):
+        _project(text)
+
+
+def test_bare_reference_to_missing_local_member_is_rejected():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    measures:
+      - {name: revenue, sql: amount, type: sum}
+      - {name: misspelled_revenue, sql: "{revene}", type: number}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [misspelled_revenue]}
+"""
+
+    with pytest.raises(ConversionError, match=r"reference '\{revene\}'.*does not match"):
         _project(text)
 
 

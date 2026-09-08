@@ -575,11 +575,15 @@ def _cube_references(text, own_cube, cubes):
             continue
         body = match.group(1).strip()
         head, dot, rest = body.partition(".")
-        if not dot and body in cubes:
-            if body != own_cube and re.match(r"\s*\.", text[match.end() :]):
-                yield "dataset", body
-            elif body != own_cube:
-                yield "member", (own_cube, body)
+        if (
+            not dot
+            and body in cubes
+            and body != own_cube
+            and re.match(r"\s*\.", text[match.end() :])
+        ):
+            yield "dataset", body
+            continue
+        if not dot and body in ("CUBE", "TABLE", own_cube):
             continue
         target = (
             (own_cube, body)
@@ -591,7 +595,7 @@ def _cube_references(text, own_cube, cubes):
                 f"reference '{{{body}}}' uses unknown cube qualifier '{head}'; "
                 "use '{cube}.column' for a raw joined-cube column"
             )
-        if dot and not _cube_has_member(cubes[target[0]], target[0], target[1]):
+        if not _cube_has_member(cubes[target[0]], target[0], target[1]):
             raise ConversionError(
                 f"reference '{{{body}}}' does not match a dimension or measure in "
                 f"cube '{target[0]}'; use '{{{target[0]}}}.{target[1]}' for a raw column"
@@ -790,7 +794,7 @@ class _DimensionResolver:
     def _resolve(self, body, own_cube, qualified, stack):
         head, dot, rest = body.partition(".")
         if not dot:
-            if body in ("CUBE", "TABLE", own_cube) or body in self._cubes:
+            if body in ("CUBE", "TABLE", own_cube):
                 return None
             target = (own_cube, body)
         else:
