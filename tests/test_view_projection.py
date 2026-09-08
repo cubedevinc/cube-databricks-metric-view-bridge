@@ -291,6 +291,101 @@ def test_hidden_unsafe_measure_dependency_is_retained_and_blocks_strict_publicat
     assert unsafe_elements == {"orders.risky_value", "users.lifetime_value"}
 
 
+def test_hidden_transitive_cross_cube_dependencies_add_their_cubes_and_joins():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - name: users
+        sql: "{CUBE}.user_id = {users}.id"
+        relationship: many_to_one
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: user_id, sql: user_id, type: number}
+    measures:
+      - name: customer_value
+        sql: "{users.account_value}"
+        type: number
+  - name: users
+    sql_table: main.sales.users
+    joins:
+      - name: accounts
+        sql: "{CUBE}.account_id = {accounts}.id"
+        relationship: many_to_one
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: account_id, sql: account_id, type: number}
+    measures:
+      - name: account_value
+        sql: "{accounts.max_lifetime_value}"
+        type: number
+  - name: accounts
+    sql_table: main.sales.accounts
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - name: max_lifetime_value
+        sql: ltv
+        type: max
+views:
+  - name: sales
+    cubes:
+      - join_path: orders
+        includes: [customer_value]
+"""
+
+    out, source, issues = _project(text)
+    model = model_of(out)
+
+    assert source == "orders"
+    assert not list(issues)
+    assert set(by_name(model["datasets"])) == {"orders", "users", "accounts"}
+    assert [(item["from"], item["to"]) for item in model["relationships"]] == [
+        ("orders", "users"),
+        ("users", "accounts"),
+    ]
+    assert set(by_name(model["metrics"])) == {"customer_value"}
+    assert expr_of(by_name(model["metrics"])["customer_value"]) == "MAX(accounts.ltv)"
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert metric_view["source"] == "main.sales.orders"
+    assert metric_view["joins"][0]["name"] == "users"
+    assert metric_view["joins"][0]["joins"][0]["name"] == "accounts"
+    assert by_name(metric_view["measures"])["customer_value"]["expr"] == (
+        "MAX(users.accounts.ltv)"
+    )
+
+
+def test_implicit_measure_dependency_rejects_ambiguous_join_paths():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+      - {name: accounts, sql: "{CUBE}.account_id = {accounts}.id", relationship: many_to_one}
+    measures:
+      - {name: value, sql: "{accounts.max_value}", type: number}
+  - name: users
+    sql_table: main.sales.users
+    joins:
+      - {name: accounts, sql: "{CUBE}.account_id = {accounts}.id", relationship: many_to_one}
+  - name: accounts
+    sql_table: main.sales.accounts
+    measures:
+      - {name: max_value, sql: value, type: max}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [value]}
+"""
+
+    with pytest.raises(ConversionError, match="multiple declared join paths"):
+        _project(text)
+
+
 def test_projection_converts_to_databricks_metric_view_without_member_collisions():
     result = convert_cube_view_to_databricks_metric_view(
         {"model.yml": _MODEL},

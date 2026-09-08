@@ -85,7 +85,23 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
     selected, paths, required_cubes, joins = _resolve_view(selected_view, view, cubes)
     resolved_source = _resolve_source(view, source, paths, required_cubes)
 
-    projected_cubes = _project_cubes(cubes, required_cubes, joins, selected)
+    needed_measures = _measure_closure(
+        cubes,
+        {
+            (member.cube, member.source_name)
+            for member in selected
+            if member.kind == "measure"
+        },
+    )
+    required_cubes, joins = _expand_measure_dependency_graph(
+        view,
+        cubes,
+        paths[0][0],
+        required_cubes,
+        joins,
+        needed_measures,
+    )
+    projected_cubes = _project_cubes(cubes, required_cubes, joins, needed_measures)
     synthetic = dump_yaml(
         {
             "cubes": list(projected_cubes.values()),
@@ -325,10 +341,7 @@ def _resolve_source(view_name, requested, paths, required):
     return requested
 
 
-def _project_cubes(cubes, required, joins, selected):
-    needed_measures = _measure_closure(
-        cubes, {(m.cube, m.source_name) for m in selected if m.kind == "measure"}
-    )
+def _project_cubes(cubes, required, joins, needed_measures):
     projected = {}
     for cube_name in required:
         cube = copy.deepcopy(cubes[cube_name])
@@ -340,6 +353,71 @@ def _project_cubes(cubes, required, joins, selected):
         ]
         projected[cube_name] = cube
     return projected
+
+
+def _expand_measure_dependency_graph(
+    view_name, cubes, root, required, joins, needed_measures
+):
+    """Add uniquely reachable cubes needed only by hidden measure dependencies."""
+
+    expanded_required = list(required)
+    expanded_joins = {cube_name: dict(targets) for cube_name, targets in joins.items()}
+    parent_of = {
+        target: cube_name
+        for cube_name, targets in expanded_joins.items()
+        for target in targets
+    }
+    dependency_cubes = sorted({cube_name for cube_name, _ in needed_measures})
+    for target in dependency_cubes:
+        if target in expanded_required:
+            continue
+        paths = _declared_join_paths(cubes, root, target, limit=2)
+        if not paths:
+            raise ConversionError(
+                f"view '{view_name}': selected measures depend on cube '{target}', "
+                f"but it has no declared join path from view root '{root}'"
+            )
+        if len(paths) > 1:
+            raise ConversionError(
+                f"view '{view_name}': selected measures depend on cube '{target}' through "
+                "multiple declared join paths; add an explicit view join_path to disambiguate it"
+            )
+        for left, right in zip(paths[0], paths[0][1:], strict=False):
+            prior_parent = parent_of.setdefault(right, left)
+            if prior_parent != left:
+                raise ConversionError(
+                    f"view '{view_name}': dependency cube '{right}' would have multiple "
+                    "parents; add an explicit view join_path to disambiguate it"
+                )
+            expanded_joins.setdefault(left, {})[right] = _find_join(cubes[left], left, right)
+            if right not in expanded_required:
+                expanded_required.append(right)
+    return expanded_required, expanded_joins
+
+
+def _declared_join_paths(cubes, start, target, limit):
+    """Return up to ``limit`` simple paths following declared Cube joins."""
+
+    found = []
+
+    def visit(current, path):
+        if len(found) >= limit:
+            return
+        joins = _as_named_list(cubes[current].get("joins"), f"cube '{current}' joins")
+        for join in joins:
+            neighbor = join.get("name")
+            if neighbor not in cubes or neighbor in path:
+                continue
+            next_path = path + [neighbor]
+            if neighbor == target:
+                found.append(next_path)
+            else:
+                visit(neighbor, next_path)
+            if len(found) >= limit:
+                return
+
+    visit(start, [start])
+    return found
 
 
 def _measure_closure(cubes, initial):

@@ -86,6 +86,11 @@ def convert_cube_view_to_databricks_metric_view(
         metric_view_yaml,
         resolved_source,
     )
+    metric_view_yaml, unsafe_metric_qualifications = _qualify_nested_metric_references(
+        normalized,
+        metric_view_yaml,
+        resolved_source,
+    )
     unhandled_warnings = [
         str(item.message)
         for item in caught
@@ -106,6 +111,17 @@ def convert_cube_view_to_databricks_metric_view(
             message=message,
         )
         for message in unhandled_warnings
+    ) + tuple(
+        BridgeIssue(
+            origin="ossie_databricks",
+            code="DATABRICKS_METRIC_JOIN_QUALIFICATION_UNSAFE",
+            message=(
+                f"Metric '{name}' references a nested joined dataset, but its expression "
+                "could not be safely join-qualified; publication must fail closed."
+            ),
+            element=name,
+        )
+        for name in unsafe_metric_qualifications
     )
     return ConversionResult(
         ossie_yaml=normalized,
@@ -203,6 +219,94 @@ def _dataset_qualifiers(model: dict, source: str) -> dict[str, str]:
             paths[child] = paths[parent] + (alias,)
             queue.append(child)
     return {name: ".".join(path) for name, path in paths.items() if path}
+
+
+def _qualify_nested_metric_references(
+    ossie_yaml: str,
+    metric_view_yaml: str,
+    source: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Replace a nested dataset name with its full Metric View join path."""
+
+    document = yaml.safe_load(ossie_yaml)
+    model = document["semantic_model"][0]
+    qualifiers = _dataset_qualifiers(model, source)
+    nested_paths = {
+        name.casefold(): tuple(part for part in qualifier.split(".") if part)
+        for name, qualifier in qualifiers.items()
+        if qualifier.casefold() != name.casefold()
+    }
+    if not nested_paths:
+        return metric_view_yaml, ()
+
+    metric_view = load_databricks_yaml(metric_view_yaml)
+    if not isinstance(metric_view, dict):
+        return metric_view_yaml, ()
+    measures = {
+        str(item.get("name", "")).casefold(): item
+        for item in metric_view.get("measures") or []
+        if isinstance(item, dict)
+    }
+    changed = False
+    unsafe = []
+    for metric in model.get("metrics") or []:
+        name = metric.get("name")
+        if not isinstance(name, str):
+            continue
+        measure = measures.get(name.casefold())
+        if measure is None or not isinstance(measure.get("expr"), str):
+            continue
+        expression = measure["expr"]
+        replacement = _rewrite_metric_dataset_paths(expression, nested_paths)
+        if replacement is None:
+            unsafe.append(name)
+        elif replacement != expression:
+            measure["expr"] = replacement
+            changed = True
+
+    return (
+        dump_databricks_yaml(metric_view) if changed else metric_view_yaml,
+        tuple(unsafe),
+    )
+
+
+def _rewrite_metric_dataset_paths(
+    expression: str,
+    nested_paths: dict[str, tuple[str, ...]],
+) -> str | None:
+    """Rewrite model-level dataset qualifiers without touching bound SQL names."""
+
+    try:
+        tokens = Dialect.get_or_raise("databricks").tokenize(expression)
+        tree = parse_one(expression, read="databricks")
+        if tree is None:
+            return None
+        replacements = []
+        for column in list(tree.find_all(exp.Column)):
+            target, parts = _complete_column_path(column)
+            if target is None or not parts:
+                return None
+            path = nested_paths.get(parts[0].name.casefold()) if len(parts) > 1 else None
+            if path is not None:
+                replacements.append((target, parts, path))
+        if not replacements:
+            return expression
+        if tree.find(exp.Query) is not None or any(
+            token.token_type is TokenType.ARROW for token in tokens
+        ):
+            return None
+        for target, parts, path in replacements:
+            target.replace(
+                exp.Dot.build(
+                    [
+                        *(exp.to_identifier(part) for part in path),
+                        *(part.copy() for part in parts[1:]),
+                    ]
+                )
+            )
+        return tree.sql(dialect="databricks")
+    except SqlglotError:
+        return None
 
 
 def _qualify_bare_columns(
