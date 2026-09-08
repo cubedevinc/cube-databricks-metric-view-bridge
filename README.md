@@ -34,6 +34,8 @@ must be statically parseable without nested query or lambda binding scopes so th
 bridge can prove the source dataset of every physical column. Joined-dataset
 references retain their Cube reference provenance; a physical multipart column is
 never inferred to be a join merely because its first component matches a cube name.
+Source-owned fields and metric columns use Databricks' explicit `source` qualifier,
+so a source struct path cannot be mistaken for a same-named emitted join.
 
 The final conversion is accepted only when every selected dimension and measure is
 still present. A `source` override may select an explicitly projected or hidden

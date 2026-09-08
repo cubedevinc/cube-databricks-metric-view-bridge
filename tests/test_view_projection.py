@@ -487,7 +487,7 @@ views:
 
     result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
     metric_view = parse(result.metric_view_yaml)
-    assert by_name(metric_view["measures"])["raw_amount"]["expr"] == "SUM(amount)"
+    assert by_name(metric_view["measures"])["raw_amount"]["expr"] == "SUM(source.amount)"
 
 
 def test_provenance_preserves_exact_aggregate_sql():
@@ -515,7 +515,7 @@ views:
     result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
     metric_view = parse(result.metric_view_yaml)
     assert by_name(metric_view["measures"])["median_amount"]["expr"] == (
-        "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount)"
+        "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY source.amount)"
     )
 
 
@@ -544,7 +544,7 @@ views:
 
     result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
     metric_view = parse(result.metric_view_yaml)
-    assert by_name(metric_view["measures"])["total"]["expr"] == "SUM(amount)"
+    assert by_name(metric_view["measures"])["total"]["expr"] == "SUM(source.amount)"
 
 
 def test_local_dimension_reference_is_not_shadowed_by_same_named_cube():
@@ -610,7 +610,9 @@ views:
 
     result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
     metric_view = parse(result.metric_view_yaml)
-    assert by_name(metric_view["measures"])["struct_total"]["expr"] == ("MAX(accounts.balance)")
+    assert by_name(metric_view["measures"])["struct_total"]["expr"] == (
+        "MAX(source.accounts.balance)"
+    )
     assert by_name(metric_view["measures"])["joined_total"]["expr"] == (
         "MAX(users.accounts.balance)"
     )
@@ -635,7 +637,7 @@ views:
     metric_view = parse(result.metric_view_yaml)
 
     assert by_name(metric_view["measures"])["max_external_value"]["expr"] == (
-        "MAX(__CUBE_DMV_DATASET_0__.value)"
+        "MAX(source.__CUBE_DMV_DATASET_0__.value)"
     )
 
 
@@ -786,7 +788,7 @@ views:
     metric_view = parse(result.metric_view_yaml)
     assert metric_view["source"] == "main.sales.users"
     assert metric_view["joins"][0]["name"] == "orders"
-    assert by_name(metric_view["measures"])["max_ltv"]["expr"] == "MAX(ltv)"
+    assert by_name(metric_view["measures"])["max_ltv"]["expr"] == "MAX(source.ltv)"
 
 
 @pytest.mark.parametrize("expression", ["{users.name}", "{users}.name"])

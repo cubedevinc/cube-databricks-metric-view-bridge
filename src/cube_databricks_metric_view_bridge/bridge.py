@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import threading
 import warnings
 from typing import Literal
 
@@ -50,6 +51,12 @@ _JOINED_COMPLEX_WARNING = re.compile(
     r"emitted as-is, verify qualification$"
 )
 
+# ``warnings.catch_warnings`` mutates process-global state on the oldest Python
+# runtime supported by this package. Keep the upstream conversion and capture in
+# one critical section so concurrent bridge calls cannot steal each other's
+# diagnostics.
+_CONVERTER_WARNING_LOCK = threading.Lock()
+
 
 def convert_cube_view_to_databricks_metric_view(
     files: dict[str, str],
@@ -76,12 +83,13 @@ def convert_cube_view_to_databricks_metric_view(
     document = yaml.safe_load(projected)
     normalized = OSIDocument.model_validate(document).to_osi_yaml()
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        metric_view_yaml = convert_ossie_to_metric_view(
-            normalized,
-            source=resolved_source,
-        )
+    with _CONVERTER_WARNING_LOCK:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            metric_view_yaml = convert_ossie_to_metric_view(
+                normalized,
+                source=resolved_source,
+            )
 
     metric_view_yaml, qualified_fields = _qualify_joined_computed_dimensions(
         normalized,
@@ -142,7 +150,8 @@ def _qualify_joined_computed_dimensions(
     Apache Ossie field expressions are dataset-scoped, while Metric View
     dimensions share one namespace. The pinned converter qualifies a single
     joined column but only warns for a computed expression. This adapter safely
-    qualifies every bare SQL column with the converter's deterministic join path.
+    qualifies computed joined fields with the converter's deterministic join path
+    and source fields with Databricks' reserved ``source`` alias.
     """
 
     document = yaml.safe_load(ossie_yaml)
@@ -158,9 +167,11 @@ def _qualify_joined_computed_dimensions(
         if isinstance(item, dict)
     }
     qualified: set[str] = set()
+    changed = False
     for dataset in model.get("datasets") or []:
         dataset_name = dataset.get("name")
-        qualifier = qualifiers.get(dataset_name)
+        is_source = dataset_name == source
+        qualifier = "source" if is_source else qualifiers.get(dataset_name)
         if not qualifier:
             continue
         for field in dataset.get("fields") or []:
@@ -170,18 +181,34 @@ def _qualify_joined_computed_dimensions(
             dimension = dimensions.get(field_name.casefold())
             if dimension is None or not isinstance(dimension.get("expr"), str):
                 continue
-            expression = dimension["expr"]
-            if _is_simple_identifier(expression):
+            original_expression = _field_expression(field)
+            if not is_source and _is_simple_identifier(original_expression):
                 continue
-            replacement = _qualify_bare_columns(expression, qualifier)
+            replacement = _qualify_bare_columns(dimension["expr"], qualifier)
             if replacement is None:
-                continue
+                raise ConversionError(
+                    f"[field '{field_name}'] expression on dataset '{dataset_name}' "
+                    "cannot be safely qualified; refusing to return a publishable "
+                    "Metric View artifact"
+                )
             dimension["expr"] = replacement
-            qualified.add(field_name.casefold())
+            changed = True
+            if not is_source:
+                qualified.add(field_name.casefold())
 
-    if not qualified:
+    if not changed:
         return metric_view_yaml, frozenset()
     return dump_databricks_yaml(metric_view), frozenset(qualified)
+
+
+def _field_expression(field: dict) -> str:
+    expression = field.get("expression")
+    if not isinstance(expression, dict):
+        return ""
+    for dialect in expression.get("dialects") or []:
+        if isinstance(dialect, dict) and isinstance(dialect.get("expression"), str):
+            return dialect["expression"]
+    return ""
 
 
 def _dataset_qualifiers(model: dict, source: str) -> dict[str, str]:
@@ -253,7 +280,7 @@ def _apply_metric_expression_templates(
     marker_paths = {}
     for dataset, marker in dataset_markers.items():
         if dataset == source:
-            marker_paths[marker.casefold()] = ()
+            marker_paths[marker.casefold()] = ("source",)
         elif dataset in qualifiers:
             marker_paths[marker.casefold()] = tuple(qualifiers[dataset].split("."))
         else:

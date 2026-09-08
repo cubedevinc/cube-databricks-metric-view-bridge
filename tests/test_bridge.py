@@ -6,11 +6,15 @@
 """End-to-end contract tests for the Cube-owned bridge boundary."""
 
 import dataclasses
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import yaml
 from ossie_cube import ConversionError
 
+import cube_databricks_metric_view_bridge.bridge as bridge_module
 from cube_databricks_metric_view_bridge import (
     ConversionResult,
     convert_cube_view_to_databricks_metric_view,
@@ -83,6 +87,76 @@ def test_nested_computed_dimension_uses_full_metric_view_join_path():
         "CONCAT(customers.countries.name, ' (', customers.countries.code, ')')"
     )
     assert not any("complex expression on a joined table" in item.message for item in result.issues)
+
+
+def test_simple_joined_dimension_is_not_qualified_twice():
+    model = _NESTED_MODEL.replace("includes: [display_name]", "includes: [name]")
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert expressions["name"] == "customers.countries.name"
+
+
+def test_source_dimensions_use_explicit_source_provenance():
+    model = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - name: users
+        sql: "{CUBE}.user_id = {users}.id"
+        relationship: many_to_one
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: user_profile_name, sql: users.name, type: string}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [id, user_profile_name]}
+      - {join_path: orders.users, includes: []}
+"""
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert expressions["id"] == "source.id"
+    assert expressions["user_profile_name"] == "source.users.name"
+
+
+def test_source_metric_path_is_not_mistaken_for_a_join_alias():
+    model = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - name: users
+        sql: "{CUBE}.user_id = {users}.id"
+        relationship: many_to_one
+    measures:
+      - {name: max_profile_balance, sql: users.balance, type: max}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [max_profile_balance]}
+      - {join_path: orders.users, includes: []}
+"""
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    measures = {item["name"]: item["expr"] for item in metric_view["measures"]}
+
+    assert measures["max_profile_balance"] == "MAX(source.users.balance)"
 
 
 def test_joined_expression_preserves_quoted_physical_column_identifiers():
@@ -292,3 +366,35 @@ def test_conversion_is_deterministic_and_result_is_immutable():
         pass
     else:
         raise AssertionError("ConversionResult must remain immutable")
+
+
+def test_concurrent_conversions_serialize_upstream_warning_capture(monkeypatch):
+    original = bridge_module.convert_ossie_to_metric_view
+    state_lock = threading.Lock()
+    active_calls = 0
+    maximum_active_calls = 0
+
+    def tracked_converter(*args, **kwargs):
+        nonlocal active_calls, maximum_active_calls
+        with state_lock:
+            active_calls += 1
+            maximum_active_calls = max(maximum_active_calls, active_calls)
+        try:
+            time.sleep(0.02)
+            return original(*args, **kwargs)
+        finally:
+            with state_lock:
+                active_calls -= 1
+
+    monkeypatch.setattr(bridge_module, "convert_ossie_to_metric_view", tracked_converter)
+    start = threading.Barrier(4)
+
+    def convert_after_barrier(_):
+        start.wait()
+        return _convert()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(convert_after_barrier, range(4)))
+
+    assert len(results) == 4
+    assert maximum_active_calls == 1
