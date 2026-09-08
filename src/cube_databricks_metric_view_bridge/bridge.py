@@ -152,7 +152,6 @@ def _qualify_joined_computed_dimensions(
         return metric_view_yaml, frozenset()
 
     qualifiers = _dataset_qualifiers(model, source)
-    known_qualifiers = frozenset({"source", *qualifiers.values()})
     dimensions = {
         str(item.get("name", "")).casefold(): item
         for item in metric_view.get("dimensions") or []
@@ -174,7 +173,7 @@ def _qualify_joined_computed_dimensions(
             expression = dimension["expr"]
             if _is_simple_identifier(expression):
                 continue
-            replacement = _qualify_bare_columns(expression, qualifier, known_qualifiers)
+            replacement = _qualify_bare_columns(expression, qualifier)
             if replacement is None:
                 continue
             dimension["expr"] = replacement
@@ -349,7 +348,6 @@ def _validate_public_surface(ossie_yaml, metric_view_yaml):
 def _qualify_bare_columns(
     expression: str,
     qualifier: str,
-    known_qualifiers: frozenset[str] = frozenset(),
 ) -> str | None:
     """Prefix dataset-scoped columns without crossing a SQL binding scope.
 
@@ -368,23 +366,11 @@ def _qualify_bare_columns(
         prefix = tuple(part for part in qualifier.split(".") if part)
         if not prefix:
             return expression
-        normalized_prefix = tuple(part.casefold() for part in prefix)
-        normalized_known = {
-            tuple(part.casefold() for part in item.split(".") if part) for item in known_qualifiers
-        }
         edits = []
         rendered_prefix = _render_identifier_path(prefix)
         for column in tree.find_all(exp.Column):
             _, parts = _complete_column_path(column)
             if not parts:
-                return None
-            normalized_parts = tuple(part.name.casefold() for part in parts)
-            if normalized_parts[: len(normalized_prefix)] == normalized_prefix:
-                continue
-            if any(
-                path and path != normalized_prefix and normalized_parts[: len(path)] == path
-                for path in normalized_known
-            ):
                 return None
             start = parts[0].meta.get("start")
             if not isinstance(start, int):

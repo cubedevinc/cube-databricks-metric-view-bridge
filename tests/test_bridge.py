@@ -138,7 +138,7 @@ def test_joined_expression_prefixes_a_root_multipart_physical_column():
     assert not any("complex expression on a joined table" in item.message for item in result.issues)
 
 
-def test_already_join_qualified_expression_is_not_prefixed_twice():
+def test_prefix_shaped_physical_path_retains_owning_dataset_provenance():
     model = _NESTED_MODEL.replace(
         "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
         "sql: \"CONCAT(customers.countries.name, ' (', customers.countries.code, ')')\"",
@@ -149,7 +149,24 @@ def test_already_join_qualified_expression_is_not_prefixed_twice():
     expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
 
     assert expressions["display_name"] == (
-        "CONCAT(customers.countries.name, ' (', customers.countries.code, ')')"
+        "CONCAT(customers.countries.customers.countries.name, ' (', "
+        "customers.countries.customers.countries.code, ')')"
+    )
+    assert not any("complex expression on a joined table" in item.message for item in result.issues)
+
+
+def test_source_shaped_physical_path_is_not_treated_as_metric_view_alias():
+    model = _NESTED_MODEL.replace(
+        "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
+        'sql: "source.id + value"',
+    )
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert expressions["display_name"] == (
+        "customers.countries.source.id + customers.countries.value"
     )
     assert not any("complex expression on a joined table" in item.message for item in result.issues)
 
@@ -159,7 +176,6 @@ def test_already_join_qualified_expression_is_not_prefixed_twice():
     [
         "(SELECT max(value) FROM items)",
         "transform(values, x -> x + 1)",
-        "source.id + value",
     ],
 )
 def test_unsafe_joined_dimension_expressions_fail_closed(expression):
