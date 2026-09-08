@@ -666,6 +666,23 @@ views:
         _project(text)
 
 
+def test_qualified_reference_to_unknown_cube_is_rejected():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    measures:
+      - {name: misspelled_cube, sql: "{usres.name}", type: max}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [misspelled_cube]}
+"""
+
+    with pytest.raises(ConversionError, match="unknown cube qualifier 'usres'"):
+        _project(text)
+
+
 def test_raw_joined_column_form_remains_allowed_without_member_metadata():
     text = """
 cubes:

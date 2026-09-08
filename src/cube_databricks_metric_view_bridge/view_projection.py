@@ -586,11 +586,12 @@ def _cube_references(text, own_cube, cubes):
             if not dot
             else (own_cube if head in ("CUBE", "TABLE", own_cube) else head, rest)
         )
-        if (
-            dot
-            and target[0] in cubes
-            and not _cube_has_member(cubes[target[0]], target[0], target[1])
-        ):
+        if dot and target[0] not in cubes:
+            raise ConversionError(
+                f"reference '{{{body}}}' uses unknown cube qualifier '{head}'; "
+                "use '{cube}.column' for a raw joined-cube column"
+            )
+        if dot and not _cube_has_member(cubes[target[0]], target[0], target[1]):
             raise ConversionError(
                 f"reference '{{{body}}}' does not match a dimension or measure in "
                 f"cube '{target[0]}'; use '{{{target[0]}}}.{target[1]}' for a raw column"
