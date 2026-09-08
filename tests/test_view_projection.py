@@ -195,8 +195,35 @@ views:
     result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
     metric_view = parse(result.metric_view_yaml)
     assert by_name(metric_view["measures"])["count"]["expr"] == (
-        "COUNT(DISTINCT CONCAT(CAST(source.l_orderkey AS VARCHAR), "
-        "CAST(source.l_linenumber AS VARCHAR)))"
+        "COUNT(DISTINCT source.l_orderkey, source.l_linenumber)"
+    )
+
+
+def test_filtered_composite_primary_key_count_filters_each_tuple_operand():
+    text = """
+cubes:
+  - name: lines
+    sql_table: samples.tpch.lineitem
+    dimensions:
+      - {name: order_id, sql: l_orderkey, type: number, primary_key: true}
+      - {name: line_id, sql: l_linenumber, type: number, primary_key: true}
+      - {name: active, sql: is_active, type: boolean}
+    measures:
+      - name: active_count
+        type: count
+        filters:
+          - sql: "{active} = true"
+views:
+  - name: sales
+    cubes:
+      - {join_path: lines, includes: [active_count]}
+"""
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert by_name(metric_view["measures"])["active_count"]["expr"] == (
+        "COUNT(DISTINCT CASE WHEN (source.is_active = true) THEN source.l_orderkey END, "
+        "CASE WHEN (source.is_active = true) THEN source.l_linenumber END)"
     )
 
 

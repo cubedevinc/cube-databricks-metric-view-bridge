@@ -909,11 +909,8 @@ class _PublicationMeasureResolver(_MeasureResolver):
             self._dimensions.expression(cube_name, primary_key, qualified=True)
             for primary_key in primary_keys
         ]
-        operand = resolved[0]
-        if len(resolved) > 1:
-            parts = ", ".join(f"CAST({expression} AS VARCHAR)" for expression in resolved)
-            operand = f"CONCAT({parts})"
-        return f"COUNT(DISTINCT {filtered_operand(operand, filters)})"
+        operands = [filtered_operand(expression, filters) for expression in resolved]
+        return f"COUNT(DISTINCT {', '.join(operands)})"
 
     def _translate(self, sql, cname, stack, inline_refs):
         prepared = _replace_raw_dataset_aliases(
