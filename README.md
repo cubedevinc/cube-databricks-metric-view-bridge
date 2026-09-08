@@ -73,8 +73,9 @@ so callers can verify that the selected public-member contract did not change.
 
 ## Dependency and provenance policy
 
-The development lockfile pins Apache Ossie core, Cube, and Databricks converters to
-commit `71222da768cf792e8820a08f77e5b37d649842d9`, the reviewed head of
+The distributable package metadata and development lockfile pin Apache Ossie core,
+Cube, and Databricks converters to commit
+`71222da768cf792e8820a08f77e5b37d649842d9`, the reviewed head of
 `apache/ossie#289`. Apache packages remain unmodified and are installed from the
 Apache repository. Cube-specific projection and compatibility behavior lives under
 the separately branded `cube_databricks_metric_view_bridge` namespace.

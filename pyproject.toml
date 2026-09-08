@@ -16,9 +16,9 @@ requires-python = ">=3.11"
 readme = "README.md"
 license = "Apache-2.0"
 dependencies = [
-    "apache-ossie==0.2.0.dev0",
-    "apache-ossie-cube==0.2.0.dev0",
-    "apache-ossie-databricks==0.2.0.dev0",
+    "apache-ossie @ git+https://github.com/apache/ossie.git@71222da768cf792e8820a08f77e5b37d649842d9#subdirectory=python",
+    "apache-ossie-cube @ git+https://github.com/apache/ossie.git@71222da768cf792e8820a08f77e5b37d649842d9#subdirectory=converters/cube",
+    "apache-ossie-databricks @ git+https://github.com/apache/ossie.git@71222da768cf792e8820a08f77e5b37d649842d9#subdirectory=converters/databricks",
     "PyYAML>=6.0",
     "pydantic>=2.0",
     "sqlglot>=20.0",
@@ -36,6 +36,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/cube_databricks_metric_view_bridge"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -52,8 +55,3 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.uv]
 required-version = ">=0.10.0"
 default-groups = ["dev"]
-
-[tool.uv.sources]
-apache-ossie = { git = "https://github.com/apache/ossie.git", rev = "71222da768cf792e8820a08f77e5b37d649842d9", subdirectory = "python" }
-apache-ossie-cube = { git = "https://github.com/apache/ossie.git", rev = "71222da768cf792e8820a08f77e5b37d649842d9", subdirectory = "converters/cube" }
-apache-ossie-databricks = { git = "https://github.com/apache/ossie.git", rev = "71222da768cf792e8820a08f77e5b37d649842d9", subdirectory = "converters/databricks" }

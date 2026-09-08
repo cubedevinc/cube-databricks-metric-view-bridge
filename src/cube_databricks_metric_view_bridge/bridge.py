@@ -18,8 +18,9 @@ from ossie import OSIDocument
 from ossie_databricks import convert_ossie_to_metric_view
 from ossie_databricks._common import dump_yaml as dump_databricks_yaml
 from ossie_databricks._common import load_yaml as load_databricks_yaml
-from sqlglot import exp, parse_one
+from sqlglot import Dialect, exp, parse_one
 from sqlglot.errors import SqlglotError
+from sqlglot.tokens import TokenType
 
 from .view_projection import convert_cube_view_to_ossie
 
@@ -134,6 +135,7 @@ def _qualify_joined_computed_dimensions(
         return metric_view_yaml, frozenset()
 
     qualifiers = _dataset_qualifiers(model, source)
+    known_qualifiers = frozenset({"source", *qualifiers.values()})
     dimensions = {
         str(item.get("name", "")).casefold(): item
         for item in metric_view.get("dimensions") or []
@@ -155,7 +157,7 @@ def _qualify_joined_computed_dimensions(
             expression = dimension["expr"]
             if _is_simple_identifier(expression):
                 continue
-            replacement = _qualify_bare_columns(expression, qualifier)
+            replacement = _qualify_bare_columns(expression, qualifier, known_qualifiers)
             if replacement is None:
                 continue
             dimension["expr"] = replacement
@@ -203,30 +205,75 @@ def _dataset_qualifiers(model: dict, source: str) -> dict[str, str]:
     return {name: ".".join(path) for name, path in paths.items() if path}
 
 
-def _qualify_bare_columns(expression: str, qualifier: str) -> str | None:
+def _qualify_bare_columns(
+    expression: str,
+    qualifier: str,
+    known_qualifiers: frozenset[str] = frozenset(),
+) -> str | None:
+    """Prefix dataset-scoped columns without crossing a SQL binding scope.
+
+    Subqueries and lambdas introduce names that do not belong to the field's
+    dataset. Until the bridge performs full scope analysis, refusing those forms
+    is safer than rewriting them and suppressing the upstream warning.
+    """
+
     try:
-        tree = parse_one(expression, read="databricks")
-        if tree is None:
+        tokens = Dialect.get_or_raise("databricks").tokenize(expression)
+        if any(token.token_type is TokenType.ARROW for token in tokens):
             return None
-        prefix = [part for part in qualifier.split(".") if part]
+        tree = parse_one(expression, read="databricks")
+        if tree is None or tree.find(exp.Query) is not None:
+            return None
+        prefix = tuple(part for part in qualifier.split(".") if part)
         if not prefix:
             return expression
+        normalized_prefix = tuple(part.casefold() for part in prefix)
+        normalized_known = {
+            tuple(part.casefold() for part in item.split(".") if part)
+            for item in known_qualifiers
+        }
         for column in list(tree.find_all(exp.Column)):
-            if column.table:
+            target, parts = _complete_column_path(column)
+            if target is None or not parts:
+                return None
+            normalized_parts = tuple(part.name.casefold() for part in parts)
+            if normalized_parts[: len(normalized_prefix)] == normalized_prefix:
                 continue
-            # Reusing the parsed identifier is important: reconstructing this path
-            # from ``column.name`` drops quoting and can turn `` `first name` ``
-            # into an alias expression or `` `x-y` `` into subtraction.
+            if any(
+                path
+                and path != normalized_prefix
+                and normalized_parts[: len(path)] == path
+                for path in normalized_known
+            ):
+                return None
             replacement = exp.Dot.build(
                 [
                     *(exp.to_identifier(part) for part in prefix),
-                    column.this.copy(),
+                    *(part.copy() for part in parts),
                 ]
             )
-            column.replace(replacement)
+            target.replace(replacement)
         return tree.sql(dialect="databricks")
     except SqlglotError:
         return None
+
+
+def _complete_column_path(
+    column: exp.Column,
+) -> tuple[exp.Expression | None, tuple[exp.Identifier, ...]]:
+    """Return the replaceable node and every identifier in a dotted path."""
+
+    if not all(isinstance(part, exp.Identifier) for part in column.parts):
+        return None, ()
+    target: exp.Expression = column
+    parts = list(column.parts)
+    while isinstance(target.parent, exp.Dot) and target.parent.this is target:
+        outer = target.parent.expression
+        if not isinstance(outer, exp.Identifier):
+            return None, ()
+        parts.append(outer)
+        target = target.parent
+    return target, tuple(parts)
 
 
 def _is_simple_identifier(expression: str) -> bool:

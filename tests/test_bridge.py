@@ -7,6 +7,7 @@
 
 import dataclasses
 
+import pytest
 import yaml
 
 from cube_databricks_metric_view_bridge import (
@@ -102,6 +103,76 @@ def test_joined_expression_preserves_quoted_physical_column_identifiers():
         "THEN CONCAT(customers.countries.`first name`, ' ', "
         "customers.countries.`last name`) ELSE customers.countries.`x-y` END"
     )
+    assert not any("complex expression on a joined table" in item.message for item in result.issues)
+
+
+def test_joined_expression_prefixes_the_complete_physical_column_path():
+    model = _NESTED_MODEL.replace(
+        "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
+        "sql: \"CONCAT(address.city, ' ', address.zip)\"",
+    )
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert expressions["display_name"] == (
+        "CONCAT(customers.countries.address.city, ' ', customers.countries.address.zip)"
+    )
+    assert not any("complex expression on a joined table" in item.message for item in result.issues)
+
+
+def test_already_join_qualified_expression_is_not_prefixed_twice():
+    model = _NESTED_MODEL.replace(
+        "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
+        "sql: \"CONCAT(customers.countries.name, ' (', customers.countries.code, ')')\"",
+    )
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert expressions["display_name"] == (
+        "CONCAT(customers.countries.name, ' (', customers.countries.code, ')')"
+    )
+    assert not any("complex expression on a joined table" in item.message for item in result.issues)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "(SELECT max(value) FROM items)",
+        "transform(values, x -> x + 1)",
+        "source.id + value",
+    ],
+)
+def test_nested_binding_scopes_are_not_rewritten_or_claimed_as_handled(expression):
+    model = _NESTED_MODEL.replace(
+        "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
+        f'sql: "{expression}"',
+    )
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert any("complex expression on a joined table" in item.message for item in result.issues)
+    assert "customers.countries" not in expressions["display_name"]
+
+
+def test_non_root_source_override_updates_source_join_direction_and_qualification():
+    result = convert_cube_view_to_databricks_metric_view(
+        {"model/views/sales.yml": _NESTED_MODEL},
+        "sales",
+        source="customers",
+    )
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert result.source == "customers"
+    assert metric_view["source"] == "main.sales.customers"
+    assert [item["name"] for item in metric_view["joins"]] == ["orders", "countries"]
+    assert expressions["display_name"] == "CONCAT(countries.name, ' (', countries.code, ')')"
     assert not any("complex expression on a joined table" in item.message for item in result.issues)
 
 
