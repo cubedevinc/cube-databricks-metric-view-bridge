@@ -442,6 +442,7 @@ cubes:
             "time_shift",
             "[{time_dimension: created_at, interval: 1 day, type: prior}]",
         ),
+        ("grain", "{include: [status]}"),
     ],
 )
 def test_multi_stage_measure_semantics_are_rejected(
@@ -471,6 +472,68 @@ cubes:
 """
 
     with pytest.raises(ConversionError, match=property_name):
+        _project(text)
+
+
+@pytest.mark.parametrize(
+    ("property_name", "property_value"),
+    [
+        ("multi_stage", "false"),
+        ("group_by", "[]"),
+        ("reduce_by", "[]"),
+        ("add_group_by", "[]"),
+        ("time_shift", "[]"),
+        ("grain", "{}"),
+    ],
+)
+def test_noop_multi_stage_defaults_remain_static(property_name, property_value):
+    text = f"""
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    measures:
+      - name: revenue
+        sql: amount
+        type: sum
+        {property_name}: {property_value}
+views:
+  - name: sales
+    cubes:
+      - {{join_path: orders, includes: [revenue]}}
+"""
+
+    out, _, _ = _project(text)
+    assert set(by_name(model_of(out)["metrics"])) == {"revenue"}
+
+
+@pytest.mark.parametrize(
+    ("property_name", "property_value"),
+    [
+        ("multi_stage", "'false'"),
+        ("group_by", "{}"),
+        ("reduce_by", "false"),
+        ("add_group_by", "status"),
+        ("time_shift", "{}"),
+        ("grain", "[]"),
+    ],
+)
+def test_malformed_multi_stage_defaults_are_rejected(property_name, property_value):
+    text = f"""
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    measures:
+      - name: revenue
+        sql: amount
+        type: sum
+        {property_name}: {property_value}
+views:
+  - name: sales
+    cubes:
+      - {{join_path: orders, includes: [revenue]}}
+"""
+
+    with pytest.raises(ConversionError, match=f"malformed {property_name}"):
         _project(text)
 
 

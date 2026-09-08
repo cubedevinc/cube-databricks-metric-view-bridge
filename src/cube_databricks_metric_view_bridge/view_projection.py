@@ -490,17 +490,11 @@ def _measure_closure(cubes, initial):
                 f"measure '{cube_name}.{measure_name}' uses rolling_window, which has "
                 "no faithful Databricks Metric View publication form"
             )
-        unsupported_multi_stage = [
-            property_name
-            for property_name in (
-                "multi_stage",
-                "group_by",
-                "reduce_by",
-                "add_group_by",
-                "time_shift",
-            )
-            if measure.get(property_name) is not None
-        ]
+        unsupported_multi_stage = _active_multi_stage_properties(
+            measure,
+            cube_name,
+            measure_name,
+        )
         if unsupported_multi_stage:
             properties = ", ".join(unsupported_multi_stage)
             raise ConversionError(
@@ -514,6 +508,41 @@ def _measure_closure(cubes, initial):
                     needed.add(target)
                     queue.append(target)
     return needed
+
+
+def _active_multi_stage_properties(measure, cube_name, measure_name):
+    active = []
+    if "multi_stage" in measure:
+        value = measure["multi_stage"]
+        if not isinstance(value, bool):
+            raise ConversionError(
+                f"measure '{cube_name}.{measure_name}' has malformed multi_stage; "
+                "expected a boolean"
+            )
+        if value:
+            active.append("multi_stage")
+
+    for property_name in ("group_by", "reduce_by", "add_group_by", "time_shift"):
+        if property_name not in measure:
+            continue
+        value = measure[property_name]
+        if not isinstance(value, list):
+            raise ConversionError(
+                f"measure '{cube_name}.{measure_name}' has malformed {property_name}; "
+                "expected a list"
+            )
+        if value:
+            active.append(property_name)
+
+    if "grain" in measure:
+        value = measure["grain"]
+        if not isinstance(value, dict):
+            raise ConversionError(
+                f"measure '{cube_name}.{measure_name}' has malformed grain; expected a mapping"
+            )
+        if value:
+            active.append("grain")
+    return active
 
 
 def _dimension_dependency_closure(cubes, needed_measures, initial_dimensions):
