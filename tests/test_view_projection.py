@@ -265,6 +265,32 @@ def test_selected_fanout_metric_is_strict_by_default_and_reported_when_relaxed()
     assert len(issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)) == 1
 
 
+def test_hidden_unsafe_measure_dependency_is_retained_and_blocks_strict_publication():
+    text = _MODEL.replace(
+        "      - name: average_value\n"
+        "        sql: \"{revenue} / {count}\"\n"
+        "        type: number",
+        "      - name: average_value\n"
+        "        sql: \"{revenue} / {count}\"\n"
+        "        type: number\n"
+        "      - name: risky_value\n"
+        "        sql: \"{users.lifetime_value} / {count}\"\n"
+        "        type: number",
+    ).replace(
+        "          - status\n          - average_value",
+        "          - status\n          - risky_value",
+    )
+
+    with pytest.raises(ConversionError, match="FANOUT_UNSAFE_METRIC"):
+        _project(text)
+
+    _, _, issues = _project(text, strict_fanout=False)
+    unsafe_elements = {
+        item.element_name for item in issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)
+    }
+    assert unsafe_elements == {"orders.risky_value", "users.lifetime_value"}
+
+
 def test_projection_converts_to_databricks_metric_view_without_member_collisions():
     result = convert_cube_view_to_databricks_metric_view(
         {"model.yml": _MODEL},

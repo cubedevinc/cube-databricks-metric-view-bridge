@@ -614,11 +614,19 @@ def _drop_cube_extension(item):
 def _publication_issues(collection, conversion, selected, required):
     wanted = {f"{member.cube}.{member.source_name}" for member in selected}
     out = IssueLog()
-    for issue in list(collection) + list(conversion):
-        element = issue.element_name
-        member_issue = any(element == name for name in wanted)
-        cube_issue = any(element == f"cube '{name}'" for name in required)
-        join_issue = element.startswith("join '")
-        if member_issue or cube_issue or join_issue:
-            out.issues.append(issue)
+    for issues, is_conversion in ((collection, False), (conversion, True)):
+        for issue in issues:
+            element = issue.element_name
+            member_issue = any(element == name for name in wanted)
+            cube_issue = any(element == f"cube '{name}'" for name in required)
+            join_issue = element.startswith("join '")
+            # The synthetic conversion contains only the selected measures and
+            # their transitive dependencies. A dependency-level fan-out issue is
+            # therefore part of a selected measure's safety contract even though
+            # the dependency itself is not exposed as a public metric.
+            dependency_fanout = (
+                is_conversion and issue.issue_type == IssueType.FANOUT_UNSAFE_METRIC
+            )
+            if member_issue or cube_issue or join_issue or dependency_fanout:
+                out.issues.append(issue)
     return out
