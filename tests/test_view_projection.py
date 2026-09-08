@@ -149,6 +149,57 @@ def test_hidden_calculated_measure_dependencies_are_inlined():
     assert "count" not in set(by_name(model_of(out)["metrics"]))
 
 
+def test_bare_count_uses_primary_key_physical_sql():
+    text = """
+cubes:
+  - name: orders
+    sql_table: samples.tpch.orders
+    dimensions:
+      - {name: id, sql: o_orderkey, type: number, primary_key: true}
+    measures:
+      - {name: count, type: count}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [count]}
+"""
+
+    out, _, _ = _project(text)
+    assert expr_of(by_name(model_of(out)["metrics"])["count"]) == (
+        "COUNT(DISTINCT orders.o_orderkey)"
+    )
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert by_name(metric_view["measures"])["count"]["expr"] == (
+        "COUNT(DISTINCT source.o_orderkey)"
+    )
+
+
+def test_bare_count_resolves_every_composite_primary_key_dimension():
+    text = """
+cubes:
+  - name: lines
+    sql_table: samples.tpch.lineitem
+    dimensions:
+      - {name: order_id, sql: l_orderkey, type: number, primary_key: true}
+      - {name: line_id, sql: l_linenumber, type: number, primary_key: true}
+    measures:
+      - {name: count, type: count}
+views:
+  - name: sales
+    cubes:
+      - {join_path: lines, includes: [count]}
+"""
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert by_name(metric_view["measures"])["count"]["expr"] == (
+        "COUNT(DISTINCT CONCAT(CAST(source.l_orderkey AS VARCHAR), "
+        "CAST(source.l_linenumber AS VARCHAR)))"
+    )
+
+
 def test_hidden_computed_dimensions_are_inlined_in_fields_and_metrics():
     out, _, _ = _project()
     model = model_of(out)

@@ -24,9 +24,9 @@ from ossie_cube._common import (
     ConversionError,
     cube_sql_to_ossie,
     dump_yaml,
+    filtered_operand,
     load_yaml,
     normalize_identifier,
-    primary_key_count_expression,
     read_stash,
     snake_keys,
     sub_outside_quotes,
@@ -893,13 +893,27 @@ class _PublicationMeasureResolver(_MeasureResolver):
                 for item in measure.get("filters") or []
                 if isinstance(item, dict) and item.get("sql")
             ]
-            expression = primary_key_count_expression(
-                self._dataset_markers[cname],
-                self._pk.get(cname) or [],
-                filters,
-            )
+            expression = self._primary_key_count_expression(cname, filters)
             return self._remember(cache, key, expression)
         return super()._expression(cname, mname, stack, inline_refs)
+
+    def _primary_key_count_expression(self, cube_name, filters):
+        primary_keys = self._pk.get(cube_name) or []
+        if not primary_keys:
+            raise ConversionError(
+                f"Cube '{cube_name}': a bare `type: count` measure needs the cube's "
+                "primary key to convert safely, but no dimension declares "
+                "`primary_key: true`"
+            )
+        resolved = [
+            self._dimensions.expression(cube_name, primary_key, qualified=True)
+            for primary_key in primary_keys
+        ]
+        operand = resolved[0]
+        if len(resolved) > 1:
+            parts = ", ".join(f"CAST({expression} AS VARCHAR)" for expression in resolved)
+            operand = f"CONCAT({parts})"
+        return f"COUNT(DISTINCT {filtered_operand(operand, filters)})"
 
     def _translate(self, sql, cname, stack, inline_refs):
         prepared = _replace_raw_dataset_aliases(
