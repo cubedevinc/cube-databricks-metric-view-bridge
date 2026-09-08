@@ -14,10 +14,10 @@ not accidentally publish private implementation members.
 
 import copy
 import dataclasses
+import re
 
 from ossie_cube._common import (
     _CUBE_REF_RE,
-    DOTTED_REF_RE,
     OSSIE_VERSION,
     VENDOR,
     ConversionError,
@@ -25,9 +25,9 @@ from ossie_cube._common import (
     dump_yaml,
     load_yaml,
     normalize_identifier,
+    primary_key_count_expression,
     read_stash,
     snake_keys,
-    split_dotted_ref,
     sub_outside_quotes,
     write_stash,
 )
@@ -42,6 +42,9 @@ from ossie_cube.cube_to_osi import (
     convert_cube_to_ossie,
 )
 from ossie_cube.expressions import has_top_level_operator, qualify_bare_columns
+from sqlglot import Dialect, exp, parse_one
+from sqlglot.errors import SqlglotError
+from sqlglot.tokens import TokenType
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,6 +54,12 @@ class _SelectedMember:
     output_name: str
     kind: str
     override: dict
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProjectionProvenance:
+    metric_templates: dict[str, str]
+    dataset_markers: dict[str, str]
 
 
 def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
@@ -67,6 +76,16 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
     fan-out is strict by default because publishing a metric that can over-count
     is worse than refusing it with a precise error.
     """
+    projected, resolved_source, issues, _ = _convert_cube_view_to_ossie_with_provenance(
+        files,
+        view,
+        source=source,
+        strict_fanout=strict_fanout,
+    )
+    return projected, resolved_source, issues
+
+
+def _convert_cube_view_to_ossie_with_provenance(files, view, source=None, strict_fanout=True):
     if not isinstance(files, dict) or not files:
         raise ConversionError("expected a non-empty mapping of {filename: YAML}")
     if not isinstance(view, str) or not view.strip():
@@ -83,14 +102,22 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
 
     selected_view = views[view]
     selected, paths, required_cubes, joins = _resolve_view(selected_view, view, cubes)
-    resolved_source = _resolve_source(view, source, paths, required_cubes)
 
     needed_measures = _measure_closure(
         cubes,
         {(member.cube, member.source_name) for member in selected if member.kind == "measure"},
     )
-    needed_dimensions = _measure_dimension_closure(cubes, needed_measures)
-    dependency_cubes = {cube_name for cube_name, _ in needed_measures | needed_dimensions}
+    selected_dimensions = {
+        (member.cube, member.source_name) for member in selected if member.kind == "dimension"
+    }
+    needed_dimensions, raw_dependency_cubes = _dimension_dependency_closure(
+        cubes,
+        needed_measures,
+        selected_dimensions,
+    )
+    dependency_cubes = {
+        cube_name for cube_name, _ in needed_measures | needed_dimensions
+    } | raw_dependency_cubes
     required_cubes, joins = _expand_dependency_graph(
         view,
         cubes,
@@ -99,6 +126,7 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
         joins,
         dependency_cubes,
     )
+    resolved_source = _resolve_source(view, source, paths[0][0], required_cubes)
     projected_cubes = _project_cubes(cubes, required_cubes, joins, needed_measures)
     synthetic = dump_yaml(
         {
@@ -111,8 +139,7 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
     )
     model = load_yaml(ossie_yaml, "projected Ossie model")["semantic_model"][0]
 
-    dim_resolver = _DimensionResolver(projected_cubes)
-    _apply_projection(model, projected_cubes, selected, dim_resolver)
+    provenance = _apply_projection(model, projected_cubes, selected)
     issues = _publication_issues(collection_issues, conversion_issues, selected, required_cubes)
     if strict_fanout:
         unsafe = issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)
@@ -123,6 +150,7 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
         dump_yaml({"version": OSSIE_VERSION, "semantic_model": [model]}),
         resolved_source,
         issues,
+        provenance,
     )
 
 
@@ -326,8 +354,7 @@ def _members_from_entry(view_name, entry, cube_name, cube):
     return out
 
 
-def _resolve_source(view_name, requested, paths, required):
-    default = paths[0][0]
+def _resolve_source(view_name, requested, default, required):
     if requested is None:
         return default
     if not isinstance(requested, str) or not requested:
@@ -426,15 +453,15 @@ def _measure_closure(cubes, initial):
         if measure is None:
             continue
         for text in _measure_expression_texts(measure):
-            for target in _member_references(text, cube_name):
+            for target in _member_references(text, cube_name, cubes):
                 if target in measures and target not in needed:
                     needed.add(target)
                     queue.append(target)
     return needed
 
 
-def _measure_dimension_closure(cubes, needed_measures):
-    """Find dimensions read directly or transitively by selected measures."""
+def _dimension_dependency_closure(cubes, needed_measures, initial_dimensions):
+    """Find dimensions and raw joined datasets needed by published members."""
 
     measures = {}
     dimensions = {}
@@ -444,15 +471,18 @@ def _measure_dimension_closure(cubes, needed_measures):
         for dimension in _as_named_list(cube.get("dimensions"), f"cube '{cube_name}' dimensions"):
             dimensions[(cube_name, dimension.get("name"))] = dimension
 
-    needed = set()
-    queue = []
+    needed = set(initial_dimensions)
+    queue = list(initial_dimensions)
+    raw_dependency_cubes = set()
     for cube_name, measure_name in needed_measures:
         measure = measures.get((cube_name, measure_name))
         if measure is None:
             continue
         for text in _measure_expression_texts(measure):
-            for target in _member_references(text, cube_name):
-                if target in dimensions and target not in needed:
+            for kind, target in _cube_references(text, cube_name, cubes):
+                if kind == "dataset":
+                    raw_dependency_cubes.add(target)
+                elif target in dimensions and target not in needed:
                     needed.add(target)
                     queue.append(target)
 
@@ -460,11 +490,19 @@ def _measure_dimension_closure(cubes, needed_measures):
         cube_name, dimension_name = queue.pop()
         dimension = dimensions[(cube_name, dimension_name)]
         for text in _dimension_expression_texts(dimension):
-            for target in _member_references(text, cube_name):
-                if target in dimensions and target not in needed:
+            for kind, target in _cube_references(text, cube_name, cubes):
+                if kind == "dataset":
+                    raw_dependency_cubes.add(target)
+                elif target in measures:
+                    raise ConversionError(
+                        f"dimension '{cube_name}.{dimension_name}' references measure "
+                        f"'{target[0]}.{target[1]}'; correlated/sub-query dimensions "
+                        "cannot be published safely"
+                    )
+                elif target in dimensions and target not in needed:
                     needed.add(target)
                     queue.append(target)
-    return needed
+    return needed, raw_dependency_cubes
 
 
 def _measure_expression_texts(measure):
@@ -493,18 +531,142 @@ def _dimension_expression_texts(dimension):
             yield label["sql"]
 
 
-def _member_references(text, own_cube):
+def _cube_references(text, own_cube, cubes):
     for match in _CUBE_REF_RE.finditer(text):
+        if match.start() and text[match.start() - 1] == "\\":
+            continue
         body = match.group(1).strip()
         head, dot, rest = body.partition(".")
-        yield (
-            (own_cube, body) if not dot else (own_cube if head in ("CUBE", "TABLE") else head, rest)
+        if not dot and body in cubes:
+            if body != own_cube and re.match(r"\s*\.", text[match.end() :]):
+                yield "dataset", body
+            elif body != own_cube:
+                yield "member", (own_cube, body)
+            continue
+        target = (
+            (own_cube, body)
+            if not dot
+            else (own_cube if head in ("CUBE", "TABLE", own_cube) else head, rest)
         )
+        yield "member", target
+
+
+def _member_references(text, own_cube, cubes):
+    for kind, target in _cube_references(text, own_cube, cubes):
+        if kind == "member":
+            yield target
+
+
+def _dataset_markers(cubes):
+    base = "__cube_dmv_dataset_"
+    corpus = repr(cubes)
+    while base in corpus:
+        base = "_" + base
+    return {cube_name: f"{base}{index}__" for index, cube_name in enumerate(cubes)}
+
+
+def _replace_raw_dataset_aliases(sql, own_cube, markers, *, reject_cross, scope):
+    text = str(sql)
+
+    def replace(match):
+        if match.start() and text[match.start() - 1] == "\\":
+            return match.group(0)
+        dataset = match.group(1).strip()
+        if (
+            dataset not in markers
+            or dataset == own_cube
+            or re.match(r"\s*\.", text[match.end() :]) is None
+        ):
+            return match.group(0)
+        if reject_cross:
+            raise ConversionError(
+                f"dimension '{scope}' reads raw joined-cube columns from '{dataset}'; "
+                "a dataset-scoped Ossie field cannot preserve that join"
+            )
+        return markers[dataset]
+
+    return _CUBE_REF_RE.sub(replace, text)
+
+
+def _qualify_physical_columns(expression, qualifier, known_qualifiers, scope):
+    """Attach provenance without reserializing or otherwise changing user SQL."""
+
+    try:
+        tokens = Dialect.get_or_raise("databricks").tokenize(expression)
+        tree = parse_one(expression, read="databricks")
+        if (
+            tree is None
+            or tree.find(exp.Query) is not None
+            or any(token.token_type is TokenType.ARROW for token in tokens)
+        ):
+            raise ConversionError(
+                f"{scope} contains nested SQL bindings that cannot be safely "
+                "attributed to Cube datasets"
+            )
+        edits = []
+        for column in tree.find_all(exp.Column):
+            _, parts = _complete_column_path(column)
+            if not parts:
+                raise ConversionError(
+                    f"{scope} contains a column path whose Cube dataset provenance "
+                    "cannot be determined"
+                )
+            if parts[0].name.casefold() in known_qualifiers:
+                continue
+            start = parts[0].meta.get("start")
+            if not isinstance(start, int):
+                raise ConversionError(
+                    f"{scope} contains a column whose source position cannot be determined"
+                )
+            edits.append((start, start, f"{qualifier}."))
+        return _apply_text_edits(expression, edits)
+    except SqlglotError as error:
+        raise ConversionError(
+            f"{scope} is not safely parseable for Cube dataset provenance: {error}"
+        ) from error
+
+
+def _complete_column_path(column):
+    if not all(isinstance(part, exp.Identifier) for part in column.parts):
+        return None, ()
+    target = column
+    parts = list(column.parts)
+    while isinstance(target.parent, exp.Dot) and target.parent.this is target:
+        outer = target.parent.expression
+        if not isinstance(outer, exp.Identifier):
+            return None, ()
+        parts.append(outer)
+        target = target.parent
+    return target, tuple(parts)
+
+
+def _apply_text_edits(text, edits):
+    """Apply non-overlapping source edits from right to left."""
+
+    result = text
+    for start, end, replacement in sorted(edits, reverse=True):
+        result = result[:start] + replacement + result[end:]
+    return result
+
+
+def _render_dataset_markers(expression, replacements):
+    def render(text):
+        for marker, replacement in replacements.items():
+            text = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(marker)}(?![A-Za-z0-9_])",
+                replacement,
+                text,
+            )
+        return text
+
+    return sub_outside_quotes(expression, render)
 
 
 class _DimensionResolver:
-    def __init__(self, cubes):
+    def __init__(self, cubes, dataset_markers):
         self._cubes = cubes
+        self._dataset_markers = dataset_markers
+        self._known_markers = frozenset(marker.casefold() for marker in dataset_markers.values())
         self._dimensions = {}
         self._measures = set()
         self._cache = {}
@@ -536,31 +698,50 @@ class _DimensionResolver:
                 cube_name, member_name, dim["case"], qualified, stack + (marker,)
             )
         elif dim.get("sql") is None:
-            expr = f"{cube_name}.{member_name}" if qualified else member_name
+            expr = f"{self._dataset_markers[cube_name]}.{member_name}" if qualified else member_name
         else:
             expr = self._translate(dim["sql"], cube_name, qualified, stack + (marker,))
         self._cache[key] = expr
         return expr
 
     def _translate(self, sql, cube_name, qualified, stack):
-        prepared = qualify_bare_columns(sql) if qualified else sql
+        scope = f"dimension '{stack[0][0]}.{stack[0][1]}'"
+        prepared = _replace_raw_dataset_aliases(
+            sql,
+            cube_name,
+            self._dataset_markers,
+            reject_cross=not qualified,
+            scope=f"{stack[0][0]}.{stack[0][1]}",
+        )
+        if qualified:
+            prepared = qualify_bare_columns(prepared)
         out, _ = cube_sql_to_ossie(
             prepared,
             cube_name,
             resolve_ref=lambda body: self._resolve(body, cube_name, qualified, stack),
-            self_prefix=cube_name if qualified else None,
+            self_prefix=self._dataset_markers[cube_name] if qualified else None,
             cube_names=self._cubes,
         )
+        if qualified:
+            out = _qualify_physical_columns(
+                out,
+                self._dataset_markers[cube_name],
+                self._known_markers,
+                scope,
+            )
         return out
 
     def _resolve(self, body, own_cube, qualified, stack):
         head, dot, rest = body.partition(".")
         if not dot:
-            if body in ("CUBE", "TABLE") or body in self._cubes:
+            if body in ("CUBE", "TABLE", own_cube) or body in self._cubes:
                 return None
             target = (own_cube, body)
         else:
-            target = (own_cube if head in ("CUBE", "TABLE") else head, rest)
+            target = (
+                own_cube if head in ("CUBE", "TABLE", own_cube) else head,
+                rest,
+            )
         if target in self._measures:
             raise ConversionError(
                 f"dimension '{stack[0][0]}.{stack[0][1]}' references measure "
@@ -609,13 +790,97 @@ class _DimensionResolver:
         return "'" + str(label if label is not None else "").replace("'", "''") + "'"
 
 
-def _apply_projection(model, cubes, selected, dim_resolver):
+class _PublicationMeasureResolver(_MeasureResolver):
+    """Inline measures while preserving the dataset origin of every column."""
+
+    def __init__(self, cubes, pk_by_cube, issues, dimensions, dataset_markers):
+        super().__init__(cubes, pk_by_cube, issues)
+        self._dimensions = dimensions
+        self._dataset_markers = dataset_markers
+        self._known_markers = frozenset(marker.casefold() for marker in dataset_markers.values())
+
+    def _expression(self, cname, mname, stack, inline_refs):
+        key = (cname, mname)
+        measure = self._raw[key]
+        measure_type = str(measure.get("type") or "").lower().replace("-", "_")
+        if measure_type == "count" and measure.get("sql") is None:
+            cache = self._caches[inline_refs]
+            if key in cache:
+                return cache[key]
+            if key in stack:
+                chain = " -> ".join(f"{c}.{m}" for c, m in stack + (key,))
+                raise ConversionError(f"measure reference cycle: {chain}")
+            filters = [
+                self._translate(item["sql"], cname, stack + (key,), inline_refs)
+                for item in measure.get("filters") or []
+                if isinstance(item, dict) and item.get("sql")
+            ]
+            expression = primary_key_count_expression(
+                self._dataset_markers[cname],
+                self._pk.get(cname) or [],
+                filters,
+            )
+            return self._remember(cache, key, expression)
+        return super()._expression(cname, mname, stack, inline_refs)
+
+    def _translate(self, sql, cname, stack, inline_refs):
+        prepared = _replace_raw_dataset_aliases(
+            sql,
+            cname,
+            self._dataset_markers,
+            reject_cross=False,
+            scope=f"{cname}.{stack[0][1] if stack else '<unknown>'}",
+        )
+        prepared = qualify_bare_columns(prepared)
+
+        def resolve(body):
+            head, dot, rest = body.partition(".")
+            if not dot:
+                target = None if body in ("CUBE", "TABLE", cname) else (cname, body)
+            else:
+                target = (
+                    cname if head in ("CUBE", "TABLE", cname) else head,
+                    rest,
+                )
+            if target is not None and self._dimensions.has_dimension(*target):
+                return self._dimensions.expression(*target, qualified=True)
+            return super(_PublicationMeasureResolver, self)._resolve(
+                body,
+                cname,
+                stack,
+                inline_refs,
+            )
+
+        out, _ = cube_sql_to_ossie(
+            prepared,
+            cname,
+            resolve_ref=resolve,
+            self_prefix=self._dataset_markers[cname],
+            cube_names=self._cube_names,
+        )
+        return _qualify_physical_columns(
+            out,
+            self._dataset_markers[cname],
+            self._known_markers,
+            f"measure '{cname}.{stack[0][1] if stack else '<unknown>'}'",
+        )
+
+
+def _apply_projection(model, cubes, selected):
     datasets = {dataset["name"]: dataset for dataset in model.get("datasets") or []}
     metrics = {metric["name"]: metric for metric in model.get("metrics") or []}
 
     pk_by_cube = {name: _primary_key_of(cube, name) for name, cube in cubes.items()}
     resolver_issues = IssueLog()
-    measure_resolver = _MeasureResolver(cubes, pk_by_cube, resolver_issues)
+    dataset_markers = _dataset_markers(cubes)
+    dim_resolver = _DimensionResolver(cubes, dataset_markers)
+    measure_resolver = _PublicationMeasureResolver(
+        cubes,
+        pk_by_cube,
+        resolver_issues,
+        dim_resolver,
+        dataset_markers,
+    )
     converts = {
         key: measure_resolver.inlined(*key) is not None for key in measure_resolver.measures()
     }
@@ -627,6 +892,7 @@ def _apply_projection(model, cubes, selected, dim_resolver):
 
     projected_fields = {name: [] for name in datasets}
     projected_metrics = []
+    metric_templates = {}
     for member in selected:
         if member.kind == "dimension":
             fields = {field["name"]: field for field in datasets[member.cube].get("fields") or []}
@@ -661,9 +927,11 @@ def _apply_projection(model, cubes, selected, dim_resolver):
                 )
             item = copy.deepcopy(metrics[source_metric_name])
             item["name"] = member.output_name
-            expression = measure_resolver.inlined(*key)
-            item["expression"]["dialects"][0]["expression"] = _inline_metric_dimensions(
-                expression, dim_resolver
+            template = measure_resolver.inlined(*key)
+            metric_templates[member.output_name] = template
+            item["expression"]["dialects"][0]["expression"] = _render_dataset_markers(
+                template,
+                {marker: cube_name for cube_name, marker in dataset_markers.items()},
             )
             _apply_override(item, member)
             projected_metrics.append(item)
@@ -689,20 +957,7 @@ def _apply_projection(model, cubes, selected, dim_resolver):
     for relationship in model.get("relationships") or []:
         _drop_cube_extension(relationship)
 
-
-def _inline_metric_dimensions(expression, resolver):
-    def replace(text):
-        def one(match):
-            cube_name, member_name = split_dotted_ref(match.group(0))
-            key = (cube_name.strip('"'), member_name.strip('"'))
-            if not resolver.has_dimension(*key):
-                return match.group(0)
-            inner = resolver.expression(*key, qualified=True)
-            return f"({inner})" if has_top_level_operator(inner) else inner
-
-        return DOTTED_REF_RE.sub(one, text)
-
-    return sub_outside_quotes(expression, replace)
+    return _ProjectionProvenance(metric_templates, dataset_markers)
 
 
 def _apply_override(item, member):

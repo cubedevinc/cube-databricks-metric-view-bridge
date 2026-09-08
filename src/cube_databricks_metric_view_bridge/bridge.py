@@ -10,7 +10,6 @@ from __future__ import annotations
 import dataclasses
 import re
 import warnings
-from collections import deque
 from typing import Literal
 
 import yaml
@@ -23,7 +22,7 @@ from sqlglot import Dialect, exp, parse_one
 from sqlglot.errors import SqlglotError
 from sqlglot.tokens import TokenType
 
-from .view_projection import convert_cube_view_to_ossie
+from .view_projection import _convert_cube_view_to_ossie_with_provenance
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,11 +65,13 @@ def convert_cube_view_to_databricks_metric_view(
     implementation details from either Apache Ossie converter.
     """
 
-    projected, resolved_source, cube_issues = convert_cube_view_to_ossie(
-        files,
-        view,
-        source=source,
-        strict_fanout=strict_fanout,
+    projected, resolved_source, cube_issues, provenance = (
+        _convert_cube_view_to_ossie_with_provenance(
+            files,
+            view,
+            source=source,
+            strict_fanout=strict_fanout,
+        )
     )
     document = yaml.safe_load(projected)
     normalized = OSIDocument.model_validate(document).to_osi_yaml()
@@ -87,22 +88,26 @@ def convert_cube_view_to_databricks_metric_view(
         metric_view_yaml,
         resolved_source,
     )
-    metric_view_yaml, unsafe_metric_qualifications = _qualify_nested_metric_references(
+    metric_view_yaml = _apply_metric_expression_templates(
         normalized,
         metric_view_yaml,
         resolved_source,
+        provenance.metric_templates,
+        provenance.dataset_markers,
     )
-    if unsafe_metric_qualifications:
-        names = ", ".join(repr(name) for name in unsafe_metric_qualifications)
-        raise ConversionError(
-            "nested joined-dataset references could not be safely qualified for "
-            f"metric(s) {names}; refusing to return a publishable Metric View artifact"
-        )
+    _validate_public_surface(normalized, metric_view_yaml)
     unhandled_warnings = [
         str(item.message)
         for item in caught
         if not _is_handled_joined_expression_warning(str(item.message), qualified_fields)
     ]
+    unsafe_dimensions = [
+        message for message in unhandled_warnings if _JOINED_COMPLEX_WARNING.fullmatch(message)
+    ]
+    if unsafe_dimensions:
+        raise ConversionError(
+            f"{unsafe_dimensions[0]}; refusing to return a publishable Metric View artifact"
+        )
     issues = tuple(
         BridgeIssue(
             origin="ossie_cube",
@@ -199,9 +204,8 @@ def _dataset_qualifiers(model: dict, source: str) -> dict[str, str]:
         return {}
     paths: dict[str, tuple[str, ...]] = {source: ()}
     used_aliases = {"source"}
-    queue: deque[str] = deque([source])
-    while queue:
-        parent = queue.popleft()
+
+    def visit(parent):
         for child in adjacency[parent]:
             if child in paths:
                 continue
@@ -213,96 +217,125 @@ def _dataset_qualifiers(model: dict, source: str) -> dict[str, str]:
                 suffix += 1
             used_aliases.add(alias)
             paths[child] = paths[parent] + (alias,)
-            queue.append(child)
+            visit(child)
+
+    visit(source)
     return {name: ".".join(path) for name, path in paths.items() if path}
 
 
-def _qualify_nested_metric_references(
+def _apply_metric_expression_templates(
     ossie_yaml: str,
     metric_view_yaml: str,
     source: str,
-) -> tuple[str, tuple[str, ...]]:
-    """Replace a nested dataset name with its full Metric View join path."""
+    templates: dict[str, str],
+    dataset_markers: dict[str, str],
+) -> str:
+    """Render provenance-bearing metric templates against emitted join aliases."""
 
     document = yaml.safe_load(ossie_yaml)
     model = document["semantic_model"][0]
     qualifiers = _dataset_qualifiers(model, source)
-    nested_paths = {
-        name.casefold(): tuple(part for part in qualifier.split(".") if part)
-        for name, qualifier in qualifiers.items()
-        if qualifier.casefold() != name.casefold()
-    }
-    if not nested_paths:
-        return metric_view_yaml, ()
-
     metric_view = load_databricks_yaml(metric_view_yaml)
     if not isinstance(metric_view, dict):
-        return metric_view_yaml, ()
+        raise ConversionError("Databricks converter returned a non-mapping Metric View")
     measures = {
         str(item.get("name", "")).casefold(): item
         for item in metric_view.get("measures") or []
         if isinstance(item, dict)
     }
-    changed = False
-    unsafe = []
-    for metric in model.get("metrics") or []:
-        name = metric.get("name")
-        if not isinstance(name, str):
-            continue
+    marker_paths = {}
+    for dataset, marker in dataset_markers.items():
+        if dataset == source:
+            marker_paths[marker.casefold()] = ()
+        elif dataset in qualifiers:
+            marker_paths[marker.casefold()] = tuple(qualifiers[dataset].split("."))
+        else:
+            raise ConversionError(
+                f"dataset '{dataset}' has no emitted Metric View join path from source '{source}'"
+            )
+
+    for name, template in templates.items():
         measure = measures.get(name.casefold())
         if measure is None or not isinstance(measure.get("expr"), str):
-            continue
-        expression = measure["expr"]
-        replacement = _rewrite_metric_dataset_paths(expression, nested_paths)
-        if replacement is None:
-            unsafe.append(name)
-        elif replacement != expression:
-            measure["expr"] = replacement
-            changed = True
-
-    return (
-        dump_databricks_yaml(metric_view) if changed else metric_view_yaml,
-        tuple(unsafe),
-    )
+            raise ConversionError(
+                f"Databricks converter dropped selected metric '{name}'; refusing publication"
+            )
+        measure["expr"] = _render_metric_template(template, marker_paths, name)
+    return dump_databricks_yaml(metric_view)
 
 
-def _rewrite_metric_dataset_paths(
-    expression: str,
-    nested_paths: dict[str, tuple[str, ...]],
-) -> str | None:
-    """Rewrite model-level dataset qualifiers without touching bound SQL names."""
+def _render_metric_template(expression, marker_paths, metric_name):
+    """Replace only provenance markers while preserving the original SQL text."""
 
     try:
         tokens = Dialect.get_or_raise("databricks").tokenize(expression)
         tree = parse_one(expression, read="databricks")
-        if tree is None:
-            return None
-        replacements = []
-        for column in list(tree.find_all(exp.Column)):
-            target, parts = _complete_column_path(column)
-            if target is None or not parts:
-                return None
-            path = nested_paths.get(parts[0].name.casefold()) if len(parts) > 1 else None
-            if path is not None:
-                replacements.append((target, parts, path))
-        if not replacements:
-            return expression
-        if tree.find(exp.Query) is not None or any(
-            token.token_type is TokenType.ARROW for token in tokens
+        if (
+            tree is None
+            or tree.find(exp.Query) is not None
+            or any(token.token_type is TokenType.ARROW for token in tokens)
         ):
-            return None
-        for target, parts, path in replacements:
-            target.replace(
-                exp.Dot.build(
-                    [
-                        *(exp.to_identifier(part) for part in path),
-                        *(part.copy() for part in parts[1:]),
-                    ]
-                )
+            raise ConversionError(
+                f"metric '{metric_name}' contains nested SQL bindings whose dataset "
+                "provenance cannot be safely rendered"
             )
-        return tree.sql(dialect="databricks")
-    except SqlglotError:
-        return None
+        edits = []
+        for column in tree.find_all(exp.Column):
+            target, parts = _complete_column_path(column)
+            if target is None or len(parts) < 2:
+                raise ConversionError(
+                    f"metric '{metric_name}' contains a column path that cannot be safely rendered"
+                )
+            path = marker_paths.get(parts[0].name.casefold())
+            if path is None:
+                raise ConversionError(
+                    f"metric '{metric_name}' contains an untracked physical column reference "
+                    f"'{target.sql(dialect='databricks')}'; refusing publication"
+                )
+            start = parts[0].meta.get("start")
+            next_start = parts[1].meta.get("start")
+            if not isinstance(start, int) or not isinstance(next_start, int):
+                raise ConversionError(
+                    f"metric '{metric_name}' contains a column whose source position "
+                    "cannot be determined"
+                )
+            rendered_path = _render_identifier_path(path)
+            edits.append((start, next_start, f"{rendered_path}." if rendered_path else ""))
+        return _apply_text_edits(expression, edits)
+    except SqlglotError as error:
+        raise ConversionError(
+            f"metric '{metric_name}' cannot be safely parsed for publication: {error}"
+        ) from error
+
+
+def _validate_public_surface(ossie_yaml, metric_view_yaml):
+    model = yaml.safe_load(ossie_yaml)["semantic_model"][0]
+    metric_view = load_databricks_yaml(metric_view_yaml)
+    if not isinstance(metric_view, dict):
+        raise ConversionError("Databricks converter returned a non-mapping Metric View")
+
+    expected_dimensions = [
+        field["name"]
+        for dataset in model.get("datasets") or []
+        for field in dataset.get("fields") or []
+    ]
+    expected_measures = [metric["name"] for metric in model.get("metrics") or []]
+    actual_dimensions = [item.get("name") for item in metric_view.get("dimensions") or []]
+    actual_measures = [item.get("name") for item in metric_view.get("measures") or []]
+
+    for kind, expected, actual in (
+        ("dimension", expected_dimensions, actual_dimensions),
+        ("measure", expected_measures, actual_measures),
+    ):
+        expected_normalized = {str(name).casefold() for name in expected}
+        actual_normalized = {str(name).casefold() for name in actual}
+        if expected_normalized != actual_normalized or len(expected) != len(actual):
+            missing = sorted(expected_normalized - actual_normalized)
+            unexpected = sorted(actual_normalized - expected_normalized)
+            raise ConversionError(
+                f"Databricks conversion changed the selected public {kind} surface "
+                f"(missing={missing}, unexpected={unexpected}); refusing publication"
+            )
 
 
 def _qualify_bare_columns(
@@ -331,9 +364,11 @@ def _qualify_bare_columns(
         normalized_known = {
             tuple(part.casefold() for part in item.split(".") if part) for item in known_qualifiers
         }
-        for column in list(tree.find_all(exp.Column)):
-            target, parts = _complete_column_path(column)
-            if target is None or not parts:
+        edits = []
+        rendered_prefix = _render_identifier_path(prefix)
+        for column in tree.find_all(exp.Column):
+            _, parts = _complete_column_path(column)
+            if not parts:
                 return None
             normalized_parts = tuple(part.name.casefold() for part in parts)
             if normalized_parts[: len(normalized_prefix)] == normalized_prefix:
@@ -343,14 +378,11 @@ def _qualify_bare_columns(
                 for path in normalized_known
             ):
                 return None
-            replacement = exp.Dot.build(
-                [
-                    *(exp.to_identifier(part) for part in prefix),
-                    *(part.copy() for part in parts),
-                ]
-            )
-            target.replace(replacement)
-        return tree.sql(dialect="databricks")
+            start = parts[0].meta.get("start")
+            if not isinstance(start, int):
+                return None
+            edits.append((start, start, f"{rendered_prefix}."))
+        return _apply_text_edits(expression, edits)
     except SqlglotError:
         return None
 
@@ -371,6 +403,19 @@ def _complete_column_path(
         parts.append(outer)
         target = target.parent
     return target, tuple(parts)
+
+
+def _render_identifier_path(parts: tuple[str, ...]) -> str:
+    return ".".join(exp.to_identifier(part).sql(dialect="databricks") for part in parts)
+
+
+def _apply_text_edits(text: str, edits: list[tuple[int, int, str]]) -> str:
+    """Apply non-overlapping source edits from right to left."""
+
+    result = text
+    for start, end, replacement in sorted(edits, reverse=True):
+        result = result[:start] + replacement + result[end:]
+    return result
 
 
 def _is_simple_identifier(expression: str) -> bool:

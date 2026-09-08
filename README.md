@@ -29,7 +29,18 @@ public Metric View members.
 
 Publication is deliberately conservative. It rejects ambiguous/multi-root view
 graphs, split views, name collisions, and selected members without a faithful
-static form. Fan-out-unsafe metrics are rejected by default.
+static form. Fan-out-unsafe metrics are rejected by default. Metric expressions
+must be statically parseable without nested query or lambda binding scopes so the
+bridge can prove the source dataset of every physical column. Joined-dataset
+references retain their Cube reference provenance; a physical multipart column is
+never inferred to be a join merely because its first component matches a cube name.
+
+The final conversion is accepted only when every selected dimension and measure is
+still present. A `source` override may select an explicitly projected or hidden
+dependency dataset, but it is rejected if reorienting joins would make Databricks
+drop a selected dimension through a one-to-many path. Joined computed dimensions
+are published only when the bridge can qualify every column safely; ambiguous SQL
+fails closed rather than returning a potentially publishable artifact.
 
 Product policy remains outside this package: choosing all/specific/pattern views,
 credentials, catalog/schema settings, writes, ownership, deletion, scheduling,
@@ -94,6 +105,7 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/):
 uv sync --locked
 uv run ruff check .
 uv run pytest
+uv build
 ```
 
 ## License and trademarks

@@ -403,7 +403,7 @@ views:
         ("users", "profiles"),
     ]
     assert expr_of(by_name(model["metrics"])["max_adjusted_score"]) == (
-        "MAX((profiles.base_score * users.multiplier))"
+        "MAX(profiles.base_score * users.multiplier)"
     )
 
     result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
@@ -411,8 +411,287 @@ views:
     assert metric_view["joins"][0]["name"] == "users"
     assert metric_view["joins"][0]["joins"][0]["name"] == "profiles"
     assert by_name(metric_view["measures"])["max_adjusted_score"]["expr"] == (
-        "MAX((users.profiles.base_score * users.multiplier))"
+        "MAX(users.profiles.base_score * users.multiplier)"
     )
+
+
+def test_raw_source_column_is_not_inlined_as_same_named_computed_dimension():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: gross, sql: gross, type: number}
+      - {name: discount, sql: discount, type: number}
+      - {name: amount, sql: "{gross} - {discount}", type: number}
+    measures:
+      - {name: raw_amount, sql: "{CUBE}.amount", type: sum}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [raw_amount]}
+"""
+
+    out, _, _ = _project(text)
+    assert expr_of(by_name(model_of(out)["metrics"])["raw_amount"]) == "SUM(orders.amount)"
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert by_name(metric_view["measures"])["raw_amount"]["expr"] == "SUM(amount)"
+
+
+def test_provenance_preserves_exact_aggregate_sql():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - name: median_amount
+        sql: PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount)
+        type: number
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [median_amount]}
+"""
+
+    out, _, _ = _project(text)
+    assert expr_of(by_name(model_of(out)["metrics"])["median_amount"]) == (
+        "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY orders.amount)"
+    )
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert by_name(metric_view["measures"])["median_amount"]["expr"] == (
+        "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount)"
+    )
+
+
+def test_lone_measure_reference_is_not_shadowed_by_same_named_cube():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - {name: users, sql: amount, type: sum}
+      - {name: total, sql: "{users}", type: number}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [total]}
+"""
+
+    out, _, _ = _project(text)
+    assert expr_of(by_name(model_of(out)["metrics"])["total"]) == "SUM(orders.amount)"
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert by_name(metric_view["measures"])["total"]["expr"] == "SUM(amount)"
+
+
+def test_raw_physical_path_is_not_rewritten_as_a_nested_dataset_reference():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    measures:
+      - {name: struct_total, sql: accounts.balance, type: max}
+      - {name: joined_total, sql: "{accounts}.balance", type: max}
+  - name: users
+    sql_table: main.sales.users
+    joins:
+      - {name: accounts, sql: "{CUBE}.account_id = {accounts}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: account_id, sql: account_id, type: number}
+  - name: accounts
+    sql_table: main.sales.accounts
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [struct_total, joined_total]}
+      - {join_path: orders.users.accounts, includes: []}
+"""
+
+    out, _, _ = _project(text)
+    assert expr_of(by_name(model_of(out)["metrics"])["struct_total"]) == (
+        "MAX(orders.accounts.balance)"
+    )
+    assert expr_of(by_name(model_of(out)["metrics"])["joined_total"]) == ("MAX(accounts.balance)")
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert by_name(metric_view["measures"])["struct_total"]["expr"] == ("MAX(accounts.balance)")
+    assert by_name(metric_view["measures"])["joined_total"]["expr"] == (
+        "MAX(users.accounts.balance)"
+    )
+
+
+def test_raw_joined_column_adds_its_hidden_dependency_join():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    measures:
+      - {name: max_ltv, sql: "{users}.ltv", type: max}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [max_ltv]}
+"""
+
+    out, _, _ = _project(text)
+    model = model_of(out)
+    assert set(by_name(model["datasets"])) == {"orders", "users"}
+    assert [(item["from"], item["to"]) for item in model["relationships"]] == [("orders", "users")]
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert metric_view["joins"][0]["name"] == "users"
+    assert by_name(metric_view["measures"])["max_ltv"]["expr"] == "MAX(users.ltv)"
+
+
+def test_hidden_dependency_dataset_can_be_selected_as_source():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    measures:
+      - {name: max_ltv, sql: "{users}.ltv", type: max}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [max_ltv]}
+"""
+
+    out, source, _ = _project(text, source="users")
+    assert source == "users"
+    assert set(by_name(model_of(out)["datasets"])) == {"orders", "users"}
+
+    result = convert_cube_view_to_databricks_metric_view(
+        {"model.yml": text},
+        "sales",
+        source="users",
+    )
+    metric_view = parse(result.metric_view_yaml)
+    assert metric_view["source"] == "main.sales.users"
+    assert metric_view["joins"][0]["name"] == "orders"
+    assert by_name(metric_view["measures"])["max_ltv"]["expr"] == "MAX(ltv)"
+
+
+@pytest.mark.parametrize("expression", ["{users.name}", "{users}.name"])
+def test_selected_dimension_cannot_read_an_implicit_joined_dataset(expression):
+    text = f"""
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {{name: users, sql: "{{CUBE}}.user_id = {{users}}.id", relationship: many_to_one}}
+    dimensions:
+      - name: user_name
+        sql: "{expression}"
+        type: string
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {{name: id, sql: id, type: number, primary_key: true}}
+      - {{name: name, sql: name, type: string}}
+views:
+  - name: sales
+    cubes:
+      - {{join_path: orders, includes: [user_name]}}
+"""
+
+    with pytest.raises(ConversionError, match="dataset-scoped Ossie field"):
+        _project(text)
+
+
+def test_selected_dimension_transitively_validates_joined_dependencies():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    dimensions:
+      - {name: user_name, sql: "UPPER({inner_name})", type: string}
+      - {name: inner_name, sql: "{users.name}", type: string}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: name, sql: name, type: string}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [user_name]}
+"""
+
+    with pytest.raises(ConversionError, match="dataset-scoped Ossie field"):
+        _project(text)
+
+
+def test_join_alias_qualification_matches_databricks_depth_first_assignment():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: a, sql: "{CUBE}.a_id = {a}.id", relationship: many_to_one}
+      - {name: source_2, sql: "{CUBE}.s2_id = {source_2}.id", relationship: many_to_one}
+  - name: a
+    sql_table: main.sales.a
+    joins:
+      - {name: source, sql: "{CUBE}.s_id = {source}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+  - name: source
+    sql_table: main.sales.source_table
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: display, sql: "UPPER(name)", type: string}
+  - name: source_2
+    sql_table: main.sales.source_2_table
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders.a.source, includes: [display]}
+      - {join_path: orders.source_2, includes: []}
+"""
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert metric_view["joins"][0]["name"] == "a"
+    assert metric_view["joins"][0]["joins"][0]["name"] == "source_2"
+    assert metric_view["joins"][1]["name"] == "source_2_2"
+    assert by_name(metric_view["dimensions"])["display"]["expr"] == ("UPPER(a.source_2.name)")
 
 
 def test_implicit_dimension_dependency_rejects_ambiguous_join_paths():

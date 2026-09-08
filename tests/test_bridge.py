@@ -11,7 +11,6 @@ import pytest
 import yaml
 from ossie_cube import ConversionError
 
-import cube_databricks_metric_view_bridge.bridge as bridge_module
 from cube_databricks_metric_view_bridge import (
     ConversionResult,
     convert_cube_view_to_databricks_metric_view,
@@ -124,6 +123,20 @@ def test_joined_expression_prefixes_the_complete_physical_column_path():
     assert not any("complex expression on a joined table" in item.message for item in result.issues)
 
 
+def test_joined_expression_prefixes_a_root_multipart_physical_column():
+    model = _NESTED_MODEL.replace(
+        "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
+        "sql: address.city",
+    )
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert expressions["display_name"] == "customers.countries.address.city"
+    assert not any("complex expression on a joined table" in item.message for item in result.issues)
+
+
 def test_already_join_qualified_expression_is_not_prefixed_twice():
     model = _NESTED_MODEL.replace(
         "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
@@ -148,23 +161,23 @@ def test_already_join_qualified_expression_is_not_prefixed_twice():
         "source.id + value",
     ],
 )
-def test_nested_binding_scopes_are_not_rewritten_or_claimed_as_handled(expression):
+def test_unsafe_joined_dimension_expressions_fail_closed(expression):
     model = _NESTED_MODEL.replace(
         "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
         f'sql: "{expression}"',
     )
 
-    result = _convert(model)
-    metric_view = yaml.safe_load(result.metric_view_yaml)
-    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
-
-    assert any("complex expression on a joined table" in item.message for item in result.issues)
-    assert "customers.countries" not in expressions["display_name"]
+    with pytest.raises(ConversionError, match="refusing to return a publishable"):
+        _convert(model)
 
 
 def test_non_root_source_override_updates_source_join_direction_and_qualification():
+    model = _NESTED_MODEL.replace(
+        "- {join_path: orders, includes: [id]}",
+        "- {join_path: orders, includes: []}",
+    )
     result = convert_cube_view_to_databricks_metric_view(
-        {"model/views/sales.yml": _NESTED_MODEL},
+        {"model/views/sales.yml": model},
         "sales",
         source="customers",
     )
@@ -176,6 +189,15 @@ def test_non_root_source_override_updates_source_join_direction_and_qualificatio
     assert [item["name"] for item in metric_view["joins"]] == ["orders", "countries"]
     assert expressions["display_name"] == "CONCAT(countries.name, ' (', countries.code, ')')"
     assert not any("complex expression on a joined table" in item.message for item in result.issues)
+
+
+def test_source_override_that_drops_a_selected_member_fails_closed():
+    with pytest.raises(ConversionError, match=r"missing=\['id'\]"):
+        convert_cube_view_to_databricks_metric_view(
+            {"model/views/sales.yml": _NESTED_MODEL},
+            "sales",
+            source="customers",
+        )
 
 
 def test_behavior_neutral_ossie_warnings_remain_visible_to_caller_policy():
@@ -191,22 +213,29 @@ def test_unparseable_joined_expression_is_not_silently_claimed_as_fixed():
         "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
         'sql: "value @@ not valid sql"',
     )
-    result = _convert(model)
-
-    assert any("complex expression on a joined table" in item.message for item in result.issues)
-
-
-def test_unsafe_nested_metric_qualification_returns_no_publishable_artifact(monkeypatch):
-    original = bridge_module._qualify_nested_metric_references
-
-    def report_unsafe(ossie_yaml, metric_view_yaml, source):
-        rewritten, _ = original(ossie_yaml, metric_view_yaml, source)
-        return rewritten, ("unsafe_metric",)
-
-    monkeypatch.setattr(bridge_module, "_qualify_nested_metric_references", report_unsafe)
-
     with pytest.raises(ConversionError, match="refusing to return a publishable"):
-        _convert()
+        _convert(model)
+
+
+def test_metric_with_nested_sql_bindings_returns_no_publishable_artifact():
+    model = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - name: unsafe_metric
+        sql: "(SELECT max(value) FROM items)"
+        type: max
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [unsafe_metric]}
+"""
+
+    with pytest.raises(ConversionError, match="nested SQL bindings"):
+        _convert(model)
 
 
 def test_conversion_is_deterministic_and_result_is_immutable():
