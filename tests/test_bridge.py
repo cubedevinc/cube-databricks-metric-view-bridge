@@ -99,6 +99,20 @@ def test_simple_joined_dimension_is_not_qualified_twice():
     assert expressions["name"] == "customers.countries.name"
 
 
+@pytest.mark.parametrize("expression", ["CURRENT_DATE", "CURRENT_USER", "TRUE"])
+def test_joined_keyword_expression_is_not_rewritten_as_a_column(expression):
+    model = _NESTED_MODEL.replace(
+        "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
+        f'sql: "{expression}"',
+    )
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+    assert expressions["display_name"] == expression
+
+
 def test_source_dimensions_use_explicit_source_provenance():
     model = """
 cubes:

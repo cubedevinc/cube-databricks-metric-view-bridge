@@ -201,9 +201,9 @@ def _qualify_joined_computed_dimensions(
             if dimension is None or not isinstance(dimension.get("expr"), str):
                 continue
             original_expression = _field_expression(field)
-            if not is_source and _is_simple_identifier(original_expression):
+            if not is_source and _is_converter_qualified_column(original_expression):
                 continue
-            replacement = _qualify_bare_columns(dimension["expr"], qualifier)
+            replacement = _qualify_bare_columns(original_expression, qualifier)
             if replacement is None:
                 raise ConversionError(
                     f"[field '{field_name}'] expression on dataset '{dataset_name}' "
@@ -458,8 +458,17 @@ def _apply_text_edits(text: str, edits: list[tuple[int, int, str]]) -> str:
     return result
 
 
-def _is_simple_identifier(expression: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expression.strip()))
+def _is_converter_qualified_column(expression: str) -> bool:
+    """Whether the pinned converter safely handles this joined expression itself."""
+
+    try:
+        tree = parse_one(expression, read="databricks")
+        if not isinstance(tree, exp.Column):
+            return False
+        _, parts = _complete_column_path(tree)
+        return len(parts) == 1 and not bool(parts[0].args.get("quoted"))
+    except SqlglotError:
+        return False
 
 
 def _is_handled_joined_expression_warning(
