@@ -41,6 +41,7 @@ from ossie_cube.cube_to_osi import (
     _MeasureResolver,
     _primary_key_of,
     convert_cube_to_ossie,
+    parked_of,
 )
 from ossie_cube.expressions import has_top_level_operator, qualify_bare_columns
 from sqlglot import Dialect, exp, parse_one
@@ -565,9 +566,14 @@ def _dimension_dependency_closure(cubes, needed_measures, initial_dimensions):
             continue
         measure_type = str(measure.get("type") or "").lower().replace("-", "_")
         if measure_type == "count" and measure.get("sql") is None:
-            for primary_key in _primary_key_of(cubes[cube_name], cube_name):
+            for primary_key, is_dimension in _publication_primary_keys(
+                cubes[cube_name],
+                cube_name,
+            ):
+                if not is_dimension:
+                    continue
                 target = (cube_name, primary_key)
-                if target in dimensions and target not in needed:
+                if target not in needed:
                     needed.add(target)
                     queue.append(target)
         for text in _measure_expression_texts(measure):
@@ -595,6 +601,14 @@ def _dimension_dependency_closure(cubes, needed_measures, initial_dimensions):
                     needed.add(target)
                     queue.append(target)
     return needed, raw_dependency_cubes
+
+
+def _publication_primary_keys(cube, cube_name):
+    """Return primary-key names paired with whether each names a Cube dimension."""
+
+    primary_keys = _primary_key_of(cube, cube_name)
+    recorded_columns = parked_of(cube.get("meta")).get("primary_key")
+    return [(primary_key, not bool(recorded_columns)) for primary_key in primary_keys]
 
 
 def _measure_expression_texts(measure):
@@ -912,6 +926,10 @@ class _PublicationMeasureResolver(_MeasureResolver):
         self._dimensions = dimensions
         self._dataset_markers = dataset_markers
         self._known_markers = frozenset(marker.casefold() for marker in dataset_markers.values())
+        self._publication_primary_keys = {
+            cube_name: _publication_primary_keys(cube, cube_name)
+            for cube_name, cube in cubes.items()
+        }
 
     def _expression(self, cname, mname, stack, inline_refs):
         key = (cname, mname)
@@ -934,7 +952,7 @@ class _PublicationMeasureResolver(_MeasureResolver):
         return super()._expression(cname, mname, stack, inline_refs)
 
     def _primary_key_count_expression(self, cube_name, filters):
-        primary_keys = self._pk.get(cube_name) or []
+        primary_keys = self._publication_primary_keys.get(cube_name) or []
         if not primary_keys:
             raise ConversionError(
                 f"Cube '{cube_name}': a bare `type: count` measure needs the cube's "
@@ -943,9 +961,9 @@ class _PublicationMeasureResolver(_MeasureResolver):
             )
         resolved = [
             self._dimensions.expression(cube_name, primary_key, qualified=True)
-            if self._dimensions.has_dimension(cube_name, primary_key)
+            if is_dimension
             else f"{self._dataset_markers[cube_name]}.{primary_key}"
-            for primary_key in primary_keys
+            for primary_key, is_dimension in primary_keys
         ]
         operands = [filtered_operand(expression, filters) for expression in resolved]
         return f"COUNT(DISTINCT {', '.join(operands)})"

@@ -303,9 +303,9 @@ cubes:
     sql_table: main.sales.orders
     meta:
       ossie:
-        primary_key: [order_key]
+        primary_key: [id]
     dimensions:
-      - {name: displayed_order_key, sql: order_key, type: number}
+      - {name: id, sql: surrogate_id, type: number}
     measures:
       - {name: count, type: count}
 views:
@@ -317,7 +317,7 @@ views:
     result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
     metric_view = parse(result.metric_view_yaml)
     assert by_name(metric_view["measures"])["count"]["expr"] == (
-        "COUNT(DISTINCT source.order_key)"
+        "COUNT(DISTINCT source.id)"
     )
 
 
