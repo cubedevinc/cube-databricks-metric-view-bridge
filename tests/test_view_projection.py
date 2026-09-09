@@ -227,6 +227,100 @@ views:
     )
 
 
+@pytest.mark.parametrize("hidden_dependency", [False, True])
+def test_bare_count_primary_key_dependencies_add_required_joins(hidden_dependency):
+    selected = "published" if hidden_dependency else "count"
+    calculated = (
+        '      - {name: published, sql: "{count}", type: number}\n'
+        if hidden_dependency
+        else ""
+    )
+    text = f"""
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {{name: users, sql: "{{CUBE}}.user_id = {{users}}.id", relationship: many_to_one}}
+    dimensions:
+      - name: external_id
+        sql: "{{users}}.external_id"
+        type: number
+        primary_key: true
+    measures:
+      - {{name: count, type: count}}
+{calculated}  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {{name: id, sql: id, type: number, primary_key: true}}
+views:
+  - name: sales
+    cubes:
+      - {{join_path: orders, includes: [{selected}]}}
+"""
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+
+    assert [join["name"] for join in metric_view["joins"]] == ["users"]
+    assert by_name(metric_view["measures"])[selected]["expr"] == (
+        "COUNT(DISTINCT users.external_id)"
+    )
+
+
+@pytest.mark.parametrize("hidden_dependency", [False, True])
+def test_bare_count_primary_key_dependencies_are_validated(hidden_dependency):
+    selected = "published" if hidden_dependency else "count"
+    calculated = (
+        '      - {name: published, sql: "{count}", type: number}\n'
+        if hidden_dependency
+        else ""
+    )
+    text = f"""
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - name: id
+        sql: "{{missing_id}}"
+        type: number
+        primary_key: true
+    measures:
+      - {{name: count, type: count}}
+{calculated}views:
+  - name: sales
+    cubes:
+      - {{join_path: orders, includes: [{selected}]}}
+"""
+
+    with pytest.raises(ConversionError, match="missing_id.*does not match"):
+        _project(text)
+
+
+def test_bare_count_preserves_a_recorded_physical_primary_key():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    meta:
+      ossie:
+        primary_key: [order_key]
+    dimensions:
+      - {name: displayed_order_key, sql: order_key, type: number}
+    measures:
+      - {name: count, type: count}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [count]}
+"""
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    metric_view = parse(result.metric_view_yaml)
+    assert by_name(metric_view["measures"])["count"]["expr"] == (
+        "COUNT(DISTINCT source.order_key)"
+    )
+
+
 def test_hidden_computed_dimensions_are_inlined_in_fields_and_metrics():
     out, _, _ = _project()
     model = model_of(out)

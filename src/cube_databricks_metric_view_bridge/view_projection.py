@@ -563,6 +563,13 @@ def _dimension_dependency_closure(cubes, needed_measures, initial_dimensions):
         measure = measures.get((cube_name, measure_name))
         if measure is None:
             continue
+        measure_type = str(measure.get("type") or "").lower().replace("-", "_")
+        if measure_type == "count" and measure.get("sql") is None:
+            for primary_key in _primary_key_of(cubes[cube_name], cube_name):
+                target = (cube_name, primary_key)
+                if target in dimensions and target not in needed:
+                    needed.add(target)
+                    queue.append(target)
         for text in _measure_expression_texts(measure):
             for kind, target in _cube_references(text, cube_name, cubes):
                 if kind == "dataset":
@@ -936,6 +943,8 @@ class _PublicationMeasureResolver(_MeasureResolver):
             )
         resolved = [
             self._dimensions.expression(cube_name, primary_key, qualified=True)
+            if self._dimensions.has_dimension(cube_name, primary_key)
+            else f"{self._dataset_markers[cube_name]}.{primary_key}"
             for primary_key in primary_keys
         ]
         operands = [filtered_operand(expression, filters) for expression in resolved]
