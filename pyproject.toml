@@ -9,7 +9,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cube-databricks-metric-view-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cube-owned bridge for converting Cube views to Databricks Metric Views through Apache Ossie"
 authors = [{ name = "Cube Dev, Inc.", email = "hello@cube.dev" }]
 requires-python = ">=3.11"

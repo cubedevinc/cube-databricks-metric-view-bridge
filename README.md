@@ -43,6 +43,15 @@ drop a selected dimension through a one-to-many path. Joined computed dimensions
 are published only when the bridge can qualify every column safely; ambiguous SQL
 fails closed rather than returning a potentially publishable artifact.
 
+Cube data source ownership and physical relation completion are explicit inputs.
+When `expected_data_source` is supplied, every projected and hidden dependency
+cube must use that Cube data source (`default` when `data_source` is omitted).
+Two-part `schema.table` sources can be completed with `default_catalog`; one-part
+table sources additionally require `default_schema`. Already-qualified sources
+and `SELECT`/`WITH` query sources are preserved. The result records the original
+and resolved source for every projected dataset so callers can show exactly what
+will be published.
+
 Product policy remains outside this package: choosing all/specific/pattern views,
 credentials, catalog/schema settings, writes, ownership, deletion, scheduling,
 and feature flags belong to Cube Cloud.
@@ -71,11 +80,15 @@ views:
 """,
     },
     "sales",
+    expected_data_source="default",
+    default_catalog="samples",
 )
 
 print(result.metric_view_yaml)
 print(result.ossie_yaml)
 print(result.source)
+for dataset in result.dataset_sources:
+    print(dataset.dataset, dataset.data_source, dataset.original_source, dataset.resolved_source)
 for issue in result.issues:
     print(issue.origin, issue.code, issue.message)
 ```

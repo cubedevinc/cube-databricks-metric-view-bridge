@@ -62,6 +62,7 @@ class _SelectedMember:
 class _ProjectionProvenance:
     metric_templates: dict[str, str]
     dataset_markers: dict[str, str]
+    dataset_data_sources: dict[str, str]
 
 
 def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
@@ -1113,7 +1114,20 @@ def _apply_projection(model, cubes, selected):
     for relationship in model.get("relationships") or []:
         _drop_cube_extension(relationship)
 
-    return _ProjectionProvenance(metric_templates, dataset_markers)
+    dataset_data_sources = {}
+    for cube_name, cube in cubes.items():
+        data_source = cube.get("data_source", "default")
+        if not isinstance(data_source, str) or not data_source.strip():
+            raise ConversionError(
+                f"cube '{cube_name}': data_source must be a non-empty string when provided"
+            )
+        dataset_data_sources[cube_name] = data_source
+
+    return _ProjectionProvenance(
+        metric_templates,
+        dataset_markers,
+        dataset_data_sources,
+    )
 
 
 def _apply_override(item, member):

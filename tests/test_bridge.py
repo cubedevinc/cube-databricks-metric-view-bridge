@@ -17,9 +17,10 @@ from ossie_cube import ConversionError
 import cube_databricks_metric_view_bridge.bridge as bridge_module
 from cube_databricks_metric_view_bridge import (
     ConversionResult,
+    DatasetSourceResolution,
     convert_cube_view_to_databricks_metric_view,
 )
-from cube_databricks_metric_view_bridge.bridge import _dataset_qualifiers
+from cube_databricks_metric_view_bridge.bridge import _dataset_qualifiers, _qualify_table_source
 
 _NESTED_MODEL = """
 cubes:
@@ -60,10 +61,11 @@ views:
 """
 
 
-def _convert(model=_NESTED_MODEL):
+def _convert(model=_NESTED_MODEL, **kwargs):
     return convert_cube_view_to_databricks_metric_view(
         {"model/views/sales.yml": model},
         "sales",
+        **kwargs,
     )
 
 
@@ -76,6 +78,170 @@ def test_returns_stable_artifacts_and_source():
     metric_view = yaml.safe_load(result.metric_view_yaml)
     assert metric_view["version"] == "1.1"
     assert metric_view["source"] == "main.sales.orders"
+    assert result.dataset_sources == (
+        DatasetSourceResolution("orders", "default", "main.sales.orders", "main.sales.orders"),
+        DatasetSourceResolution(
+            "customers", "default", "main.sales.customers", "main.sales.customers"
+        ),
+        DatasetSourceResolution(
+            "countries", "default", "main.sales.countries", "main.sales.countries"
+        ),
+    )
+
+
+def test_catalog_qualifies_every_two_part_source_and_clears_handled_warnings():
+    model = _NESTED_MODEL.replace("main.sales.", "sales.")
+
+    result = _convert(
+        model,
+        expected_data_source="default",
+        default_catalog="analytics",
+    )
+
+    ossie = yaml.safe_load(result.ossie_yaml)["semantic_model"][0]
+    assert [item["source"] for item in ossie["datasets"]] == [
+        "analytics.sales.orders",
+        "analytics.sales.customers",
+        "analytics.sales.countries",
+    ]
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    assert metric_view["source"] == "analytics.sales.orders"
+    assert metric_view["joins"][0]["source"] == "analytics.sales.customers"
+    assert metric_view["joins"][0]["joins"][0]["source"] == "analytics.sales.countries"
+    assert [item.resolved_source for item in result.dataset_sources] == [
+        "analytics.sales.orders",
+        "analytics.sales.customers",
+        "analytics.sales.countries",
+    ]
+    assert not any(item.code == "SOURCE_NOT_FULLY_QUALIFIED" for item in result.issues)
+
+
+def test_catalog_and_schema_qualify_one_part_source():
+    model = _NESTED_MODEL.replace("main.sales.", "")
+
+    result = _convert(model, default_catalog="analytics", default_schema="sales")
+
+    assert yaml.safe_load(result.metric_view_yaml)["source"] == "analytics.sales.orders"
+    assert result.dataset_sources[0] == DatasetSourceResolution(
+        "orders",
+        "default",
+        "orders",
+        "analytics.sales.orders",
+    )
+
+
+@pytest.mark.parametrize(
+    "model, kwargs, message",
+    [
+        (
+            _NESTED_MODEL.replace("main.sales.", "sales."),
+            {},
+            "provide default_catalog",
+        ),
+        (
+            _NESTED_MODEL.replace("main.sales.", ""),
+            {"default_catalog": "analytics"},
+            "provide default_schema",
+        ),
+    ],
+)
+def test_unqualified_sources_fail_without_explicit_namespace_context(model, kwargs, message):
+    with pytest.raises(ConversionError, match=message):
+        _convert(model, **kwargs)
+
+
+def test_expected_data_source_rejects_a_joined_cube_from_another_connection():
+    model = _NESTED_MODEL.replace(
+        "\n  - name: customers\n    sql_table:",
+        "\n  - name: customers\n    data_source: secondary\n    sql_table:",
+    )
+
+    with pytest.raises(
+        ConversionError,
+        match="dataset 'customers'.*'secondary'.*requested data source 'default'",
+    ):
+        _convert(model, expected_data_source="default")
+
+
+def test_expected_non_default_data_source_requires_explicit_cube_ownership():
+    with pytest.raises(
+        ConversionError,
+        match="dataset 'orders'.*'default'.*requested data source 'warehouse'",
+    ):
+        _convert(expected_data_source="warehouse")
+
+
+def test_query_sources_are_not_qualified():
+    model = _NESTED_MODEL.replace(
+        "sql_table: main.sales.orders",
+        "sql: SELECT * FROM main.sales.orders",
+    )
+
+    result = _convert(model, default_catalog="ignored", default_schema="ignored")
+
+    source = result.dataset_sources[0]
+    assert source.original_source == source.resolved_source
+    assert source.resolved_source == "SELECT * FROM main.sales.orders"
+
+
+def test_identifier_qualification_is_quote_aware():
+    resolved = _qualify_table_source(
+        "`default.schema`.`line.items`",
+        "line_items",
+        default_catalog="`analytics.catalog`",
+        default_schema=None,
+    )
+
+    assert resolved == "`analytics.catalog`.`default.schema`.`line.items`"
+
+
+def test_quoted_dotted_identifiers_survive_the_pinned_converter():
+    model = _NESTED_MODEL
+    for table in ("orders", "customers", "countries"):
+        model = model.replace(
+            f"sql_table: main.sales.{table}",
+            f"sql_table: '`sales.schema`.{table}'",
+        )
+
+    result = _convert(model, default_catalog="`analytics.catalog`")
+
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    assert metric_view["source"] == "`analytics.catalog`.`sales.schema`.orders"
+    assert metric_view["joins"][0]["source"] == ("`analytics.catalog`.`sales.schema`.customers")
+    assert metric_view["joins"][0]["joins"][0]["source"] == (
+        "`analytics.catalog`.`sales.schema`.countries"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "catalog..orders",
+        ".schema.orders",
+        "..orders",
+        "``.schema.orders",
+        "` `.schema.orders",
+    ],
+)
+def test_empty_source_identifier_parts_are_rejected(source):
+    with pytest.raises(ConversionError, match="empty identifier part"):
+        _qualify_table_source(
+            source,
+            "orders",
+            default_catalog="analytics",
+            default_schema="sales",
+        )
+
+
+@pytest.mark.parametrize("value", ["analytics.reporting", "", "   ", "``", "` `"])
+def test_default_catalog_must_be_one_non_empty_identifier(value):
+    with pytest.raises(ConversionError, match="default_catalog"):
+        _qualify_table_source(
+            "default.orders",
+            "orders",
+            default_catalog=value,
+            default_schema=None,
+        )
 
 
 def test_nested_computed_dimension_uses_full_metric_view_join_path():
