@@ -36,6 +36,16 @@ class BridgeIssue:
 
 
 @dataclasses.dataclass(frozen=True)
+class DatasetSourceResolution:
+    """Physical source selected for one projected Cube dataset."""
+
+    dataset: str
+    data_source: str
+    original_source: str
+    resolved_source: str
+
+
+@dataclasses.dataclass(frozen=True)
 class ConversionResult:
     """Deterministic intermediate and final artifacts for one Cube view."""
 
@@ -43,6 +53,7 @@ class ConversionResult:
     metric_view_yaml: str
     source: str
     issues: tuple[BridgeIssue, ...]
+    dataset_sources: tuple[DatasetSourceResolution, ...] = ()
 
 
 _JOINED_COMPLEX_WARNING = re.compile(
@@ -81,6 +92,9 @@ def convert_cube_view_to_databricks_metric_view(
     *,
     source: str | None = None,
     strict_fanout: bool = True,
+    expected_data_source: str | None = None,
+    default_catalog: str | None = None,
+    default_schema: str | None = None,
 ) -> ConversionResult:
     """Convert one static Cube YAML view into Metric View YAML 1.1.
 
@@ -98,17 +112,26 @@ def convert_cube_view_to_databricks_metric_view(
         )
     )
     document = yaml.safe_load(projected)
+    dataset_sources = _resolve_dataset_sources(
+        document,
+        provenance.dataset_data_sources,
+        expected_data_source=expected_data_source,
+        default_catalog=default_catalog,
+        default_schema=default_schema,
+    )
     normalized = OSIDocument.model_validate(document).to_osi_yaml()
+    converter_input, converter_sources = _mask_converter_sources(normalized)
 
     caught: list[str] = []
     warning_token = _converter_warning_sink.set(caught)
     try:
         metric_view_yaml = convert_ossie_to_metric_view(
-            normalized,
+            converter_input,
             source=resolved_source,
         )
     finally:
         _converter_warning_sink.reset(warning_token)
+    metric_view_yaml = _restore_converter_sources(metric_view_yaml, converter_sources)
 
     metric_view_yaml, qualified_fields = _qualify_joined_computed_dimensions(
         normalized,
@@ -135,6 +158,10 @@ def convert_cube_view_to_databricks_metric_view(
         raise ConversionError(
             f"{unsafe_dimensions[0]}; refusing to return a publishable Metric View artifact"
         )
+    qualified_datasets = {
+        item.dataset for item in dataset_sources if item.original_source != item.resolved_source
+    }
+    qualified_elements = {f"cube '{name}'" for name in qualified_datasets}
     issues = tuple(
         BridgeIssue(
             origin="ossie_cube",
@@ -143,6 +170,10 @@ def convert_cube_view_to_databricks_metric_view(
             element=item.element_name,
         )
         for item in cube_issues
+        if not (
+            item.issue_type.value == "SOURCE_NOT_FULLY_QUALIFIED"
+            and item.element_name in qualified_elements
+        )
     ) + tuple(
         BridgeIssue(
             origin="ossie_databricks",
@@ -156,7 +187,187 @@ def convert_cube_view_to_databricks_metric_view(
         metric_view_yaml=metric_view_yaml,
         source=resolved_source,
         issues=issues,
+        dataset_sources=dataset_sources,
     )
+
+
+def _resolve_dataset_sources(
+    document: dict,
+    data_sources: dict[str, str],
+    *,
+    expected_data_source: str | None,
+    default_catalog: str | None,
+    default_schema: str | None,
+) -> tuple[DatasetSourceResolution, ...]:
+    """Validate Cube datasource ownership and qualify physical table sources."""
+
+    if expected_data_source is not None and (
+        not isinstance(expected_data_source, str) or not expected_data_source.strip()
+    ):
+        raise ConversionError("expected_data_source must be a non-empty string when provided")
+
+    model = document["semantic_model"][0]
+    resolutions = []
+    for dataset in model.get("datasets") or []:
+        dataset_name = dataset.get("name")
+        data_source = data_sources.get(dataset_name)
+        if not isinstance(dataset_name, str) or not isinstance(data_source, str):
+            raise ConversionError("projected dataset provenance is incomplete")
+        if expected_data_source is not None and data_source != expected_data_source:
+            raise ConversionError(
+                f"dataset '{dataset_name}' uses Cube data source '{data_source}', "
+                f"but publication requested data source '{expected_data_source}'"
+            )
+
+        original_source = dataset.get("source")
+        if not isinstance(original_source, str) or not original_source.strip():
+            raise ConversionError(f"Dataset '{dataset_name}': missing/empty 'source'")
+        original_source = original_source.strip()
+        resolved_source = _qualify_table_source(
+            original_source,
+            dataset_name,
+            default_catalog=default_catalog,
+            default_schema=default_schema,
+        )
+        dataset["source"] = resolved_source
+        resolutions.append(
+            DatasetSourceResolution(
+                dataset=dataset_name,
+                data_source=data_source,
+                original_source=original_source,
+                resolved_source=resolved_source,
+            )
+        )
+    return tuple(resolutions)
+
+
+def _qualify_table_source(
+    source: str,
+    dataset_name: str,
+    *,
+    default_catalog: str | None,
+    default_schema: str | None,
+) -> str:
+    """Complete a static table identifier without guessing missing namespaces."""
+
+    if re.match(r"(?i)(select|with)\b", source):
+        return source
+    try:
+        tokens = Dialect.get_or_raise("databricks").tokenize(source)
+        table = parse_one(source, read="databricks", into=exp.Table)
+    except SqlglotError as error:
+        raise ConversionError(
+            f"Dataset '{dataset_name}': source '{source}' is neither a static Databricks "
+            "table identifier nor a SELECT/WITH subquery"
+        ) from error
+
+    if (
+        not tokens
+        or tokens[0].token_type is TokenType.DOT
+        or tokens[-1].token_type is TokenType.DOT
+        or any(
+            left.token_type is TokenType.DOT and right.token_type is TokenType.DOT
+            for left, right in zip(tokens, tokens[1:], strict=False)
+        )
+    ):
+        raise ConversionError(
+            f"Dataset '{dataset_name}': source '{source}' contains an empty identifier part"
+        )
+
+    parts = list(table.parts)
+    if not 1 <= len(parts) <= 3 or not all(isinstance(part, exp.Identifier) for part in parts):
+        raise ConversionError(
+            f"Dataset '{dataset_name}': source '{source}' must contain one to three "
+            "Databricks identifier parts"
+        )
+    if not all(part.name.strip() for part in parts):
+        raise ConversionError(
+            f"Dataset '{dataset_name}': source '{source}' contains an empty identifier part"
+        )
+
+    if len(parts) < 3:
+        catalog = _parse_default_identifier(default_catalog, "default_catalog", dataset_name)
+        if catalog is None:
+            raise ConversionError(
+                f"Dataset '{dataset_name}': source '{source}' is not catalog-qualified; "
+                "provide default_catalog from the selected Databricks data source"
+            )
+        if len(parts) == 1:
+            schema = _parse_default_identifier(default_schema, "default_schema", dataset_name)
+            if schema is None:
+                raise ConversionError(
+                    f"Dataset '{dataset_name}': source '{source}' has no schema; provide "
+                    "default_schema together with default_catalog"
+                )
+            parts = [catalog, schema, *parts]
+        else:
+            parts = [catalog, *parts]
+
+    return ".".join(part.sql(dialect="databricks") for part in parts)
+
+
+def _mask_converter_sources(ossie_yaml: str) -> tuple[str, dict[str, str]]:
+    """Shield validated sources from the pinned converter's dot-splitting validator."""
+
+    document = yaml.safe_load(ossie_yaml)
+    model = document["semantic_model"][0]
+    replacements = {}
+    for index, dataset in enumerate(model.get("datasets") or []):
+        source = dataset["source"]
+        placeholder = f"__cube_bridge__.resolved.dataset_{index}"
+        replacements[placeholder] = source
+        dataset["source"] = placeholder
+    return OSIDocument.model_validate(document).to_osi_yaml(), replacements
+
+
+def _restore_converter_sources(metric_view_yaml: str, replacements: dict[str, str]) -> str:
+    """Restore physical relations after the converter has built its join tree."""
+
+    metric_view = load_databricks_yaml(metric_view_yaml)
+    if not isinstance(metric_view, dict):
+        raise ConversionError("Databricks converter returned a non-mapping Metric View")
+
+    restored = set()
+
+    def restore(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "source" and isinstance(item, str) and item in replacements:
+                    value[key] = replacements[item]
+                    restored.add(item)
+                else:
+                    restore(item)
+        elif isinstance(value, list):
+            for item in value:
+                restore(item)
+
+    restore(metric_view)
+    remaining = set(replacements) - restored
+    if remaining:
+        raise ConversionError(
+            "Databricks converter did not preserve every projected dataset source"
+        )
+    return dump_databricks_yaml(metric_view)
+
+
+def _parse_default_identifier(value, option, dataset_name):
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConversionError(f"{option} must be a non-empty Databricks identifier when provided")
+    try:
+        table = parse_one(value.strip(), read="databricks", into=exp.Table)
+    except SqlglotError as error:
+        raise ConversionError(
+            f"Dataset '{dataset_name}': {option} '{value}' is not a valid Databricks identifier"
+        ) from error
+    parts = list(table.parts)
+    if len(parts) != 1 or not isinstance(parts[0], exp.Identifier) or not parts[0].name.strip():
+        raise ConversionError(
+            f"Dataset '{dataset_name}': {option} '{value}' must be exactly one identifier; "
+            "quote dots that are part of its name"
+        )
+    return parts[0]
 
 
 def _qualify_joined_computed_dimensions(
