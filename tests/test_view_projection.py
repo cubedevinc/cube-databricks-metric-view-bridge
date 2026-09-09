@@ -409,6 +409,92 @@ def test_wildcard_and_excludes_follow_cube_view_semantics():
     assert set(by_name(model["metrics"])) == {"average_value"}
 
 
+def test_wildcard_skips_private_members_but_explicit_includes_can_publish_them():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: status, sql: status, type: string}
+      - {name: internal_status, sql: internal_status, type: string, public: false}
+    measures:
+      - {name: revenue, sql: revenue, type: sum}
+      - {name: internal_revenue, sql: internal_revenue, type: sum, public: false}
+views:
+  - name: wildcard_sales
+    cubes:
+      - {join_path: orders, includes: '*'}
+  - name: explicit_sales
+    cubes:
+      - {join_path: orders, includes: [internal_status, internal_revenue]}
+"""
+
+    wildcard, _, _ = convert_cube_view_to_ossie({"model.yml": text}, "wildcard_sales")
+    wildcard_model = model_of(wildcard)
+    wildcard_orders = by_name(wildcard_model["datasets"])["orders"]
+    assert set(by_name(wildcard_orders.get("fields"))) == {"id", "status"}
+    assert set(by_name(wildcard_model.get("metrics"))) == {"revenue"}
+
+    explicit, _, _ = convert_cube_view_to_ossie({"model.yml": text}, "explicit_sales")
+    explicit_model = model_of(explicit)
+    explicit_orders = by_name(explicit_model["datasets"])["orders"]
+    assert set(by_name(explicit_orders.get("fields"))) == {"internal_status"}
+    assert set(by_name(explicit_model.get("metrics"))) == {"internal_revenue"}
+
+
+def test_wildcard_skips_ossie_generated_measure_helpers():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - name: total_part
+        sql: amount
+        type: sum
+        public: false
+        meta:
+          ossie:
+            part_of: total
+      - {name: total, sql: "{total_part}", type: number}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: '*'}
+"""
+
+    result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
+    measures = by_name(parse(result.metric_view_yaml).get("measures"))
+
+    assert set(measures) == {"total"}
+    assert measures["total"]["expr"] == "SUM(source.amount)"
+
+
+def test_explicit_ossie_generated_measure_helper_fails_closed():
+    text = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    measures:
+      - name: total_part
+        sql: amount
+        type: sum
+        public: false
+        meta:
+          ossie:
+            part_of: total
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [total_part]}
+"""
+
+    with pytest.raises(ConversionError, match="internal Ossie-generated aggregate helper"):
+        convert_cube_view_to_ossie({"model.yml": text}, "sales")
+
+
 def test_source_override_is_returned_and_validated():
     _, source, _ = _project(source="users")
     assert source == "users"

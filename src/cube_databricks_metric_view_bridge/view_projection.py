@@ -287,7 +287,13 @@ def _members_from_entry(view_name, entry, cube_name, cube):
     }
     includes = entry.get("includes", [])
     if includes == "*":
-        requested = [(name, name, {}) for members in collections.values() for name in members]
+        requested = [
+            (name, name, {})
+            for kind, members in collections.items()
+            for name, definition in members.items()
+            if definition.get("public") is not False
+            and (kind != "measure" or not _is_generated_part(definition))
+        ]
     elif isinstance(includes, list):
         requested = []
         for include in includes:
@@ -349,6 +355,11 @@ def _members_from_entry(view_name, entry, cube_name, cube):
         if source_name in excludes:
             continue
         kind, definition = found[0]
+        if kind == "measure" and _is_generated_part(definition):
+            raise ConversionError(
+                f"view '{view_name}': measure '{cube_name}.{source_name}' is an internal "
+                "Ossie-generated aggregate helper and cannot be published directly"
+            )
         if kind in ("segment", "hierarchy"):
             raise ConversionError(
                 f"view '{view_name}': selected {kind} "
