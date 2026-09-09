@@ -13,11 +13,8 @@ redistributing modified packages under Apache product names.
 
 ## Status
 
-This repository is under initial development. It is not yet a supported release.
-
-The repository is currently internal during development. A sandbox that installs
-the package from GitHub will require the repository to become public or the package
-to be published in a service-accessible package registry before production use.
+This repository is public and under initial development. It is not yet a supported
+release.
 
 ## Supported input
 
