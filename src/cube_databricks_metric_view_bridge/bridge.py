@@ -109,6 +109,7 @@ def convert_cube_view_to_databricks_metric_view(
             view,
             source=source,
             strict_fanout=strict_fanout,
+            carry_join_conditions=True,
         )
     )
     document = yaml.safe_load(projected)
@@ -120,7 +121,7 @@ def convert_cube_view_to_databricks_metric_view(
         default_schema=default_schema,
     )
     normalized = OSIDocument.model_validate(document).to_osi_yaml()
-    converter_input, converter_sources = _mask_converter_sources(normalized)
+    converter_input, converter_sources, source_datasets = _mask_converter_sources(normalized)
 
     caught: list[str] = []
     warning_token = _converter_warning_sink.set(caught)
@@ -131,6 +132,12 @@ def convert_cube_view_to_databricks_metric_view(
         )
     finally:
         _converter_warning_sink.reset(warning_token)
+    metric_view_yaml = _apply_join_conditions(
+        metric_view_yaml,
+        provenance.join_conditions,
+        provenance.dataset_markers,
+        source_datasets,
+    )
     metric_view_yaml = _restore_converter_sources(metric_view_yaml, converter_sources)
 
     metric_view_yaml, qualified_fields = _qualify_joined_computed_dimensions(
@@ -306,18 +313,84 @@ def _qualify_table_source(
     return ".".join(part.sql(dialect="databricks") for part in parts)
 
 
-def _mask_converter_sources(ossie_yaml: str) -> tuple[str, dict[str, str]]:
-    """Shield validated sources from the pinned converter's dot-splitting validator."""
+def _mask_converter_sources(ossie_yaml: str) -> tuple[str, dict[str, str], dict[str, str]]:
+    """Shield validated sources from the pinned converter's dot-splitting validator.
+
+    Returns the masked model, {placeholder: source} and {placeholder: dataset}.
+    """
 
     document = yaml.safe_load(ossie_yaml)
     model = document["semantic_model"][0]
     replacements = {}
+    datasets = {}
     for index, dataset in enumerate(model.get("datasets") or []):
         source = dataset["source"]
         placeholder = f"__cube_bridge__.resolved.dataset_{index}"
         replacements[placeholder] = source
+        datasets[placeholder] = dataset["name"]
         dataset["source"] = placeholder
-    return OSIDocument.model_validate(document).to_osi_yaml(), replacements
+    return OSIDocument.model_validate(document).to_osi_yaml(), replacements, datasets
+
+
+def _apply_join_conditions(
+    metric_view_yaml: str,
+    join_conditions: dict[str, tuple[str, str, str]],
+    dataset_markers: dict[str, str],
+    source_datasets: dict[str, str],
+) -> str:
+    """Write each carried Cube join condition into the join the converter emitted.
+
+    The converter emits such a join as ``using: [carrier]``. Its parent is the
+    enclosing join, or ``source``, and either cube may sit on either side when a
+    source override reorients the join, so each side is found by its dataset.
+    Runs before the masked sources are restored, while they still name datasets.
+    """
+
+    if not join_conditions:
+        return metric_view_yaml
+    metric_view = load_databricks_yaml(metric_view_yaml)
+    if not isinstance(metric_view, dict):
+        raise ConversionError("Databricks converter returned a non-mapping Metric View")
+    pending = set(join_conditions)
+
+    def visit(joins, parent_alias, parent_dataset):
+        for index, join in enumerate(joins or []):
+            if not isinstance(join, dict):
+                continue
+            dataset = source_datasets.get(join.get("source"))
+            using = join.get("using")
+            carrier = using[0] if isinstance(using, list) and len(using) == 1 else None
+            if carrier in join_conditions:
+                own, target, template = join_conditions[carrier]
+                aliases = {parent_dataset: (parent_alias,), dataset: (join["name"],)}
+                if {own, target} != set(aliases):
+                    raise ConversionError(
+                        f"join '{own}' -> '{target}' was emitted between other datasets; "
+                        "refusing publication"
+                    )
+                condition = _render_metric_template(
+                    template,
+                    {
+                        dataset_markers[own].casefold(): aliases[own],
+                        dataset_markers[target].casefold(): aliases[target],
+                    },
+                    f"join '{own}' -> '{target}'",
+                )
+                # `on` takes the place of `using`, so the join keeps its key order.
+                joins[index] = join = {
+                    ("on" if key == "using" else key): (condition if key == "using" else value)
+                    for key, value in join.items()
+                }
+                pending.discard(carrier)
+            visit(join.get("joins"), join.get("name"), dataset)
+
+    visit(metric_view.get("joins"), "source", source_datasets.get(metric_view.get("source")))
+    if pending:
+        raise ConversionError(
+            "Databricks converter dropped a join whose Cube condition it cannot express; "
+            "refusing publication"
+        )
+    return dump_databricks_yaml(metric_view)
 
 
 def _restore_converter_sources(metric_view_yaml: str, replacements: dict[str, str]) -> str:
@@ -524,11 +597,11 @@ def _apply_metric_expression_templates(
             raise ConversionError(
                 f"Databricks converter dropped selected metric '{name}'; refusing publication"
             )
-        measure["expr"] = _render_metric_template(template, marker_paths, name)
+        measure["expr"] = _render_metric_template(template, marker_paths, f"metric '{name}'")
     return dump_databricks_yaml(metric_view)
 
 
-def _render_metric_template(expression, marker_paths, metric_name):
+def _render_metric_template(expression, marker_paths, scope):
     """Replace only provenance markers while preserving the original SQL text."""
 
     try:
@@ -540,7 +613,7 @@ def _render_metric_template(expression, marker_paths, metric_name):
             or any(token.token_type is TokenType.ARROW for token in tokens)
         ):
             raise ConversionError(
-                f"metric '{metric_name}' contains nested SQL bindings whose dataset "
+                f"{scope} contains nested SQL bindings whose dataset "
                 "provenance cannot be safely rendered"
             )
         edits = []
@@ -548,27 +621,26 @@ def _render_metric_template(expression, marker_paths, metric_name):
             target, parts = _complete_column_path(column)
             if target is None or len(parts) < 2:
                 raise ConversionError(
-                    f"metric '{metric_name}' contains a column path that cannot be safely rendered"
+                    f"{scope} contains a column path that cannot be safely rendered"
                 )
             path = marker_paths.get(parts[0].name.casefold())
             if path is None:
                 raise ConversionError(
-                    f"metric '{metric_name}' contains an untracked physical column reference "
+                    f"{scope} contains an untracked physical column reference "
                     f"'{target.sql(dialect='databricks')}'; refusing publication"
                 )
             start = parts[0].meta.get("start")
             next_start = parts[1].meta.get("start")
             if not isinstance(start, int) or not isinstance(next_start, int):
                 raise ConversionError(
-                    f"metric '{metric_name}' contains a column whose source position "
-                    "cannot be determined"
+                    f"{scope} contains a column whose source position cannot be determined"
                 )
             rendered_path = _render_identifier_path(path)
             edits.append((start, next_start, f"{rendered_path}." if rendered_path else ""))
         return _apply_text_edits(expression, edits)
     except SqlglotError as error:
         raise ConversionError(
-            f"metric '{metric_name}' cannot be safely parsed for publication: {error}"
+            f"{scope} cannot be safely parsed for publication: {error}"
         ) from error
 
 

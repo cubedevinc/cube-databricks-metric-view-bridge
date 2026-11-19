@@ -43,6 +43,18 @@ drop a selected dimension through a one-to-many path. Joined computed dimensions
 are published only when the bridge can qualify every column safely; ambiguous SQL
 fails closed rather than returning a potentially publishable artifact.
 
+A join whose condition is not a plain column equality, such as a range on effective
+dates (SCD2), an expression like `CAST(...)` or `date_trunc(...)`, or a comparison
+with a literal or keyword like `true` or `current_date`, is published with its Cube
+condition as the Metric View join's `on`. Member references in the condition expand
+to their SQL. Such a join gets the same fan-out checks as an equality join and no
+`rely.at_most_one_match`. A condition that reads a cube other than the two it joins,
+a measure, or a `table.column` written without a cube reference is rejected. The
+intermediate Ossie artifact of
+`convert_cube_view_to_databricks_metric_view` carries such a join as a relationship
+on a carrier column, since an Ossie relationship holds only column equalities;
+`convert_cube_view_to_ossie` leaves the join out, as the Cube converter does.
+
 Cube data source ownership and physical relation completion are explicit inputs.
 When `expected_data_source` is supplied, every projected and hidden dependency
 cube must use that Cube data source (`default` when `data_source` is omitted).

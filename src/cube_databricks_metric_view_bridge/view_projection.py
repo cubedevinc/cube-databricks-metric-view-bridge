@@ -28,15 +28,18 @@ from ossie_cube._common import (
     load_yaml,
     normalize_identifier,
     read_stash,
+    snake,
     snake_keys,
     sub_outside_quotes,
     write_stash,
 )
 from ossie_cube.converter_issues import IssueLog, IssueType
 from ossie_cube.cube_to_osi import (
+    _RELATIONSHIP_ALIASES,
     _ai_context_from_meta,
     _as_named_list,
     _collect,
+    _decompose_join_sql,
     _is_generated_part,
     _MeasureResolver,
     _primary_key_of,
@@ -63,6 +66,8 @@ class _ProjectionProvenance:
     metric_templates: dict[str, str]
     dataset_markers: dict[str, str]
     dataset_data_sources: dict[str, str]
+    # Carrier column -> (declaring cube, joined cube, condition template).
+    join_conditions: dict[str, tuple[str, str, str]]
 
 
 def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
@@ -88,7 +93,9 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
     return projected, resolved_source, issues
 
 
-def _convert_cube_view_to_ossie_with_provenance(files, view, source=None, strict_fanout=True):
+def _convert_cube_view_to_ossie_with_provenance(
+    files, view, source=None, strict_fanout=True, carry_join_conditions=False
+):
     if not isinstance(files, dict) or not files:
         raise ConversionError("expected a non-empty mapping of {filename: YAML}")
     if not isinstance(view, str) or not view.strip():
@@ -131,9 +138,13 @@ def _convert_cube_view_to_ossie_with_provenance(files, view, source=None, strict
     )
     resolved_source = _resolve_source(view, source, paths[0][0], required_cubes)
     projected_cubes = _project_cubes(cubes, required_cubes, joins, needed_measures)
+    carriers = _condition_join_carriers(projected_cubes) if carry_join_conditions else {}
     synthetic = dump_yaml(
         {
-            "cubes": list(projected_cubes.values()),
+            "cubes": [
+                _with_carrier_joins(cube_name, cube, carriers)
+                for cube_name, cube in projected_cubes.items()
+            ],
             "views": [selected_view],
         }
     )
@@ -142,7 +153,7 @@ def _convert_cube_view_to_ossie_with_provenance(files, view, source=None, strict
     )
     model = load_yaml(ossie_yaml, "projected Ossie model")["semantic_model"][0]
 
-    provenance = _apply_projection(model, projected_cubes, selected)
+    provenance = _apply_projection(model, projected_cubes, selected, carriers)
     issues = _publication_issues(collection_issues, conversion_issues, selected, required_cubes)
     if strict_fanout:
         unsafe = issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)
@@ -404,6 +415,56 @@ def _project_cubes(cubes, required, joins, needed_measures):
         ]
         projected[cube_name] = cube
     return projected
+
+
+def _is_plain_column(name):
+    """Whether SQL reads ``name`` as a column; the pinned Cube converter takes any
+    bare word in a join equality for one, ``true`` and ``current_date`` included."""
+
+    try:
+        return isinstance(parse_one(name, read="databricks"), exp.Column)
+    except SqlglotError:
+        return False
+
+
+def _condition_join_carriers(cubes):
+    """Name a carrier column for each join whose condition has no Ossie relationship form.
+
+    An Ossie relationship is an equi-join on column pairs, so the Cube converter
+    parks a range or expression condition and drops the join with every cube
+    behind it. Such a join travels instead as an equality on a carrier column no
+    table has: the converters keep it in the join graph, with the same fan-out
+    checks as any other join, and the bridge writes the Cube condition into the
+    Metric View join. Returns {(cube, joined cube): carrier}.
+    """
+
+    base = "__cube_dmv_join_"
+    corpus = repr(cubes).casefold()
+    while base in corpus:
+        base = "_" + base
+    carriers = {}
+    for cube_name, cube in cubes.items():
+        for join in _as_named_list(cube.get("joins"), f"cube '{cube_name}' joins"):
+            relationship = _RELATIONSHIP_ALIASES.get(snake(str(join.get("relationship") or "")))
+            sql = join.get("sql")
+            if relationship is None or not isinstance(sql, str):
+                continue
+            pairs = _decompose_join_sql(sql, cube_name, join.get("name"), "", cubes, IssueLog())
+            if pairs is None or not all(
+                _is_plain_column(column) for pair in pairs for column in pair
+            ):
+                carriers[(cube_name, join.get("name"))] = f"{base}{len(carriers)}__"
+    return carriers
+
+
+def _with_carrier_joins(cube_name, cube, carriers):
+    joins = []
+    for join in _as_named_list(cube.get("joins"), f"cube '{cube_name}' joins"):
+        carrier = carriers.get((cube_name, join.get("name")))
+        if carrier:
+            join = {**join, "sql": f"{{CUBE}}.{carrier} = {{{join['name']}}}.{carrier}"}
+        joins.append(join)
+    return {**cube, "joins": joins}
 
 
 def _expand_dependency_graph(view_name, cubes, root, required, joins, dependency_cubes):
@@ -728,8 +789,12 @@ def _replace_raw_dataset_aliases(sql, own_cube, markers, *, reject_cross, scope)
     return _CUBE_REF_RE.sub(replace, text)
 
 
-def _qualify_physical_columns(expression, qualifier, known_qualifiers, scope):
-    """Attach provenance without reserializing or otherwise changing user SQL."""
+def _qualify_physical_columns(expression, qualifier, known_qualifiers, scope, bare_only=False):
+    """Attach provenance without reserializing or otherwise changing user SQL.
+
+    With ``bare_only``, a multipart column outside ``known_qualifiers`` is refused
+    rather than read as a struct path of ``qualifier``.
+    """
 
     try:
         tokens = Dialect.get_or_raise("databricks").tokenize(expression)
@@ -753,6 +818,12 @@ def _qualify_physical_columns(expression, qualifier, known_qualifiers, scope):
                 )
             if parts[0].name.casefold() in known_qualifiers:
                 continue
+            if bare_only and len(parts) > 1:
+                path = ".".join(part.name for part in parts)
+                raise ConversionError(
+                    f"{scope} reads '{path}', which is not a column of a cube it can "
+                    "reach; reference columns as '{cube}.column'"
+                )
             start = parts[0].meta.get("start")
             if not isinstance(start, int):
                 raise ConversionError(
@@ -764,6 +835,27 @@ def _qualify_physical_columns(expression, qualifier, known_qualifiers, scope):
         raise ConversionError(
             f"{scope} is not safely parseable for Cube dataset provenance: {error}"
         ) from error
+
+
+def _rename_column_qualifiers(expression, renames):
+    """Replace the first part of each multipart column found in ``renames``.
+
+    SQL that cannot be parsed is returned unchanged for the caller's own checks.
+    """
+
+    try:
+        tree = parse_one(expression, read="databricks")
+    except SqlglotError:
+        return expression
+    edits = []
+    for column in tree.find_all(exp.Column) if tree is not None else ():
+        _, parts = _complete_column_path(column)
+        if len(parts) < 2 or parts[0].name.casefold() not in renames:
+            continue
+        start, end = parts[0].meta.get("start"), parts[1].meta.get("start")
+        if isinstance(start, int) and isinstance(end, int):
+            edits.append((start, end, f"{renames[parts[0].name.casefold()]}."))
+    return _apply_text_edits(expression, edits)
 
 
 def _complete_column_path(column):
@@ -818,6 +910,69 @@ class _DimensionResolver:
 
     def has_dimension(self, cube_name, member_name):
         return (cube_name, member_name) in self._dimensions
+
+    def join_condition(self, own_cube, target, sql):
+        """A join's Cube SQL with every column qualified by its cube's dataset marker."""
+
+        scope = f"join '{own_cube}' -> '{target}'"
+        for match in _CUBE_REF_RE.finditer(sql):
+            if match.start() and sql[match.start() - 1] == "\\":
+                continue
+            head, dot, _ = match.group(1).strip().partition(".")
+            if head in ("CUBE", "TABLE", own_cube, target) or (
+                not dot and _cube_has_member(self._cubes[own_cube], own_cube, head)
+            ):
+                continue
+            raise ConversionError(
+                f"{scope} reads cube '{head}'; a Databricks Metric View join condition "
+                "can read only the two cubes it joins"
+            )
+        for kind, reference in _cube_references(sql, own_cube, self._cubes):
+            if kind == "member" and reference in self._measures:
+                raise ConversionError(
+                    f"{scope} references measure '{reference[0]}.{reference[1]}'; a join "
+                    "condition can read only columns and dimensions"
+                )
+
+        # Columns are qualified with sqlglot rather than qualify_bare_columns, which
+        # reads a date unit such as DAY as a column. A bare column belongs to the
+        # declaring cube, as the Cube converter reads it in an equality join; a
+        # `table.column` with no cube reference could name any table, so it is refused.
+        def qualified(expression, cube_name):
+            return _qualify_physical_columns(
+                expression.strip(),
+                self._dataset_markers[cube_name],
+                self._known_markers,
+                scope,
+                bare_only=True,
+            )
+
+        def resolve(body):
+            head, dot, rest = body.partition(".")
+            cube_name = own_cube if head in ("CUBE", "TABLE", own_cube) or not dot else head
+            member = rest if dot else body
+            if not self.has_dimension(cube_name, member):
+                return None
+            inner = qualified(self.expression(cube_name, member), cube_name)
+            return f"({inner})" if has_top_level_operator(inner) else inner
+
+        prepared = _replace_raw_dataset_aliases(
+            sql, own_cube, self._dataset_markers, reject_cross=False, scope=scope
+        )
+        out, _ = cube_sql_to_ossie(
+            prepared,
+            own_cube,
+            resolve_ref=resolve,
+            self_prefix=self._dataset_markers[own_cube],
+            cube_names=self._cubes,
+        )
+        # Cube aliases each cube's table by the cube's name, so in its join SQL
+        # `orders.id` is a column of the joined cube `orders`.
+        named = {
+            cube_name.casefold(): self._dataset_markers[cube_name]
+            for cube_name in (own_cube, target)
+        }
+        return qualified(_rename_column_qualifiers(out, named), own_cube)
 
     def expression(self, cube_name, member_name, qualified=False, stack=()):
         key = (cube_name, member_name, qualified)
@@ -1023,7 +1178,7 @@ class _PublicationMeasureResolver(_MeasureResolver):
         )
 
 
-def _apply_projection(model, cubes, selected):
+def _apply_projection(model, cubes, selected, carriers):
     datasets = {dataset["name"]: dataset for dataset in model.get("datasets") or []}
     metrics = {metric["name"]: metric for metric in model.get("metrics") or []}
 
@@ -1031,6 +1186,14 @@ def _apply_projection(model, cubes, selected):
     resolver_issues = IssueLog()
     dataset_markers = _dataset_markers(cubes)
     dim_resolver = _DimensionResolver(cubes, dataset_markers)
+    join_conditions = {
+        carrier: (
+            own,
+            target,
+            dim_resolver.join_condition(own, target, _find_join(cubes[own], own, target)["sql"]),
+        )
+        for (own, target), carrier in carriers.items()
+    }
     measure_resolver = _PublicationMeasureResolver(
         cubes,
         pk_by_cube,
@@ -1127,6 +1290,7 @@ def _apply_projection(model, cubes, selected):
         metric_templates,
         dataset_markers,
         dataset_data_sources,
+        join_conditions,
     )
 
 

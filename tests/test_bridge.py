@@ -607,3 +607,305 @@ def test_unrelated_warnings_are_not_swallowed_or_mislabeled(monkeypatch):
 
     assert [str(item.message) for item in emitted] == ["unrelated application warning"]
     assert not any("unrelated application warning" in issue.message for issue in result.issues)
+
+
+_CONDITION_MODEL = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - name: customers
+        relationship: many_to_one
+        sql: >-
+          {CUBE}.customer_id = {customers}.id
+          AND {CUBE}.ordered_at >= {customers}.valid_from
+          AND {CUBE}.ordered_at < {customers}.valid_to
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: order_month, sql: "date_trunc('month', {CUBE}.ordered_at)", type: time}
+    measures:
+      - {name: count, type: count}
+  - name: customers
+    sql_table: main.sales.customers_history
+    joins:
+      - name: regions
+        relationship: many_to_one
+        sql: >-
+          {CUBE}.region_id = {regions}.id
+          AND {CUBE}.valid_from >= {regions}.valid_from
+          AND {CUBE}.valid_from < {regions}.valid_to
+    dimensions:
+      - {name: version_id, sql: version_id, type: number, primary_key: true}
+      - {name: tier, sql: tier, type: string}
+    measures:
+      - {name: credit_limit, sql: credit_limit, type: sum}
+  - name: regions
+    sql_table: main.sales.regions_history
+    dimensions:
+      - {name: version_id, sql: version_id, type: number, primary_key: true}
+      - {name: name, sql: name, type: string}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [id, count]}
+      - {join_path: orders.customers, includes: [tier]}
+      - {join_path: orders.customers.regions, prefix: true, includes: [name]}
+"""
+
+
+def _joins_by_name(metric_view):
+    found = {}
+
+    def visit(joins):
+        for join in joins or []:
+            found[join["name"]] = join
+            visit(join.get("joins"))
+
+    visit(metric_view.get("joins"))
+    return found
+
+
+def test_range_join_condition_is_published_as_written():
+    result = _convert(_CONDITION_MODEL)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    joins = _joins_by_name(metric_view)
+
+    assert joins["customers"]["on"] == (
+        "source.customer_id = customers.id AND source.ordered_at >= customers.valid_from "
+        "AND source.ordered_at < customers.valid_to"
+    )
+    # A nested join reads its parent by the parent join's name, as an equality join does.
+    assert joins["regions"]["on"] == (
+        "customers.region_id = regions.id AND customers.valid_from >= regions.valid_from "
+        "AND customers.valid_from < regions.valid_to"
+    )
+    assert not any("using" in join or "rely" in join for join in joins.values())
+    expressions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+    assert expressions["regions_name"] == "customers.regions.name"
+
+
+def test_expression_join_condition_resolves_member_references_and_keeps_literals():
+    model = _CONDITION_MODEL.replace(
+        "{CUBE}.customer_id = {customers}.id\n"
+        "          AND {CUBE}.ordered_at >= {customers}.valid_from\n"
+        "          AND {CUBE}.ordered_at < {customers}.valid_to",
+        "CAST({CUBE}.customer_id AS INT) = {customers}.id\n"
+        "          AND {CUBE.order_month} = dateadd(DAY, 1, {customers.tier})\n"
+        "          AND {customers}.is_current = true AND {customers}.kind IN ('a', 'b')",
+    )
+
+    result = _convert(model)
+    joins = _joins_by_name(yaml.safe_load(result.metric_view_yaml))
+
+    assert joins["customers"]["on"] == (
+        "CAST(source.customer_id AS INT) = customers.id "
+        "AND date_trunc('month', source.ordered_at) = dateadd(DAY, 1, customers.tier) "
+        "AND customers.is_current = true AND customers.kind IN ('a', 'b')"
+    )
+
+
+@pytest.mark.parametrize(
+    ("condition", "published"),
+    [
+        ("{customers}.is_current = true", "customers.is_current = true"),
+        ("{customers}.snapshot_date = current_date", "customers.snapshot_date = current_date"),
+    ],
+)
+def test_keyword_in_an_equality_join_is_not_read_as_a_column(condition, published):
+    model = _NESTED_MODEL.replace(
+        '"{CUBE}.customer_id = {customers}.id"',
+        f'"{{CUBE}}.customer_id = {{customers}}.id AND {condition}"',
+    )
+
+    joins = _joins_by_name(yaml.safe_load(_convert(model).metric_view_yaml))
+
+    assert joins["customers"]["on"] == f"source.customer_id = customers.id AND {published}"
+
+
+def test_keyword_in_a_one_to_many_join_reached_by_a_measure_is_not_read_as_a_column():
+    model = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - name: line_items
+        relationship: one_to_many
+        sql: "{CUBE}.id = {line_items}.order_id AND {line_items}.is_valid = true"
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - {name: max_qty, sql: "{line_items}.qty", type: max}
+  - name: line_items
+    sql_table: main.sales.line_items
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [id, max_qty]}
+"""
+
+    joins = _joins_by_name(yaml.safe_load(_convert(model).metric_view_yaml))
+
+    assert joins["line_items"]["on"] == (
+        "source.id = line_items.order_id AND line_items.is_valid = true"
+    )
+    assert joins["line_items"]["cardinality"] == "one_to_many"
+
+
+def test_equality_joins_keep_their_column_form():
+    joins = _joins_by_name(yaml.safe_load(_convert().metric_view_yaml))
+
+    assert joins["customers"]["on"] == "source.customer_id = customers.id"
+    assert joins["customers"]["rely"] == {"at_most_one_match": True}
+
+
+def test_condition_join_keeps_fanout_checks():
+    model = _CONDITION_MODEL.replace("includes: [tier]", "includes: [tier, credit_limit]")
+
+    with pytest.raises(ConversionError, match="credit_limit"):
+        _convert(model)
+    relaxed = _convert(model, strict_fanout=False)
+    assert any(item.code == "FANOUT_UNSAFE_METRIC" for item in relaxed.issues)
+
+
+def test_source_override_reorients_a_condition_join():
+    model = _CONDITION_MODEL.replace(
+        "- {join_path: orders, includes: [id, count]}",
+        "- {join_path: orders, includes: []}",
+    )
+
+    result = _convert(model, source="customers")
+    joins = _joins_by_name(yaml.safe_load(result.metric_view_yaml))
+
+    assert joins["orders"]["on"] == (
+        "orders.customer_id = source.id AND orders.ordered_at >= source.valid_from "
+        "AND orders.ordered_at < source.valid_to"
+    )
+    assert joins["regions"]["on"].startswith("source.region_id = regions.id")
+
+
+def test_one_to_one_condition_join_is_published_and_its_note_left_to_the_caller():
+    model = _CONDITION_MODEL.replace(
+        "- name: customers\n        relationship: many_to_one",
+        "- name: customers\n        relationship: one_to_one",
+    )
+
+    result = _convert(model)
+    joins = _joins_by_name(yaml.safe_load(result.metric_view_yaml))
+
+    assert joins["customers"]["on"].startswith("source.customer_id = customers.id AND")
+    assert any(
+        item.code == "PARKED_IN_META" and item.element == "join 'orders' -> 'customers'"
+        for item in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("condition", "message"),
+    [
+        ("{CUBE}.customer_id = {customers}.id AND {regions}.name = 'EU'", "reads cube 'regions'"),
+        ("{CUBE}.customer_id = {customers}.id AND {CUBE.count} > 0", "references measure"),
+    ],
+)
+def test_condition_join_reading_beyond_its_two_cubes_is_refused(condition, message):
+    model = _CONDITION_MODEL.replace(
+        "{CUBE}.customer_id = {customers}.id\n"
+        "          AND {CUBE}.ordered_at >= {customers}.valid_from\n"
+        "          AND {CUBE}.ordered_at < {customers}.valid_to",
+        condition,
+    )
+
+    with pytest.raises(ConversionError, match=message):
+        _convert(model)
+
+
+def test_public_ossie_projection_does_not_carry_condition_joins():
+    from cube_databricks_metric_view_bridge import convert_cube_view_to_ossie
+
+    ossie_yaml, _, _ = convert_cube_view_to_ossie(
+        {"model/views/sales.yml": _CONDITION_MODEL}, "sales", strict_fanout=False
+    )
+
+    assert "__cube_dmv_join_" not in ossie_yaml
+
+
+def test_condition_member_reference_keeps_date_units_as_units():
+    model = _CONDITION_MODEL.replace(
+        "{name: order_month, sql: \"date_trunc('month', {CUBE}.ordered_at)\", type: time}",
+        '{name: order_month, sql: "dateadd(DAY, 1, ordered_at)", type: time}',
+    ).replace(
+        "{CUBE}.customer_id = {customers}.id\n"
+        "          AND {CUBE}.ordered_at >= {customers}.valid_from\n"
+        "          AND {CUBE}.ordered_at < {customers}.valid_to",
+        "{CUBE}.customer_id = {customers}.id AND {order_month} < {customers}.valid_to",
+    )
+
+    joins = _joins_by_name(yaml.safe_load(_convert(model).metric_view_yaml))
+
+    assert joins["customers"]["on"] == (
+        "source.customer_id = customers.id AND dateadd(DAY, 1, source.ordered_at) < customers.valid_to"
+    )
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "orders.customer_id = customers.id AND orders.ordered_at >= Customers.valid_from",
+        "{CUBE}.customer_id = customers.id AND {CUBE}.ordered_at >= customers.valid_from",
+    ],
+)
+def test_condition_column_qualified_by_a_joined_cube_name_reads_that_cube(condition):
+    model = _CONDITION_MODEL.replace(
+        "{CUBE}.customer_id = {customers}.id\n"
+        "          AND {CUBE}.ordered_at >= {customers}.valid_from\n"
+        "          AND {CUBE}.ordered_at < {customers}.valid_to",
+        condition,
+    )
+
+    joins = _joins_by_name(yaml.safe_load(_convert(model).metric_view_yaml))
+
+    assert joins["customers"]["on"] == (
+        "source.customer_id = customers.id AND source.ordered_at >= customers.valid_from"
+    )
+
+
+def test_condition_column_qualified_by_another_table_name_is_refused():
+    model = _CONDITION_MODEL.replace(
+        "{CUBE}.customer_id = {customers}.id\n"
+        "          AND {CUBE}.ordered_at >= {customers}.valid_from\n"
+        "          AND {CUBE}.ordered_at < {customers}.valid_to",
+        "{CUBE}.customer_id = {customers}.id AND regions.name = 'EU'",
+    )
+
+    with pytest.raises(ConversionError, match="reads 'regions.name'"):
+        _convert(model)
+
+
+def test_condition_member_reading_a_cube_outside_the_view_is_refused():
+    model = (
+        _CONDITION_MODEL.replace(
+            "{CUBE}.customer_id = {customers}.id\n"
+            "          AND {CUBE}.ordered_at >= {customers}.valid_from\n"
+            "          AND {CUBE}.ordered_at < {customers}.valid_to",
+            "{CUBE}.customer_id = {customers}.id AND {CUBE.segment_code} = {customers}.tier",
+        )
+        .replace(
+            "      - {name: id, sql: id, type: number, primary_key: true}\n"
+            "      - {name: order_month,",
+            "      - {name: id, sql: id, type: number, primary_key: true}\n"
+            '      - {name: segment_code, sql: "{segments}.code", type: string}\n'
+            "      - {name: order_month,",
+        )
+        .replace(
+            "views:",
+            "  - name: segments\n"
+            "    sql_table: main.sales.segments\n"
+            "    dimensions:\n"
+            "      - {name: code, sql: code, type: string, primary_key: true}\n"
+            "views:",
+        )
+    )
+
+    with pytest.raises(ConversionError, match="reads 'segments.code'"):
+        _convert(model)
