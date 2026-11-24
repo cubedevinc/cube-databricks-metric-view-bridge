@@ -46,7 +46,7 @@ from ossie_cube.cube_to_osi import (
     convert_cube_to_ossie,
     parked_of,
 )
-from ossie_cube.expressions import has_top_level_operator, qualify_bare_columns
+from ossie_cube.expressions import has_top_level_operator
 from sqlglot import Dialect, exp, parse_one
 from sqlglot.errors import SqlglotError
 from sqlglot.tokens import TokenType
@@ -64,6 +64,8 @@ class _SelectedMember:
 @dataclasses.dataclass(frozen=True)
 class _ProjectionProvenance:
     metric_templates: dict[str, str]
+    # Selected dimensions that read another cube, by output name.
+    dimension_templates: dict[str, str]
     dataset_markers: dict[str, str]
     dataset_data_sources: dict[str, str]
     # Carrier column -> (declaring cube, joined cube, condition template).
@@ -94,7 +96,7 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
 
 
 def _convert_cube_view_to_ossie_with_provenance(
-    files, view, source=None, strict_fanout=True, carry_join_conditions=False
+    files, view, source=None, strict_fanout=True, metric_view=False
 ):
     if not isinstance(files, dict) or not files:
         raise ConversionError("expected a non-empty mapping of {filename: YAML}")
@@ -138,7 +140,7 @@ def _convert_cube_view_to_ossie_with_provenance(
     )
     resolved_source = _resolve_source(view, source, paths[0][0], required_cubes)
     projected_cubes = _project_cubes(cubes, required_cubes, joins, needed_measures)
-    carriers = _condition_join_carriers(projected_cubes) if carry_join_conditions else {}
+    carriers = _condition_join_carriers(projected_cubes) if metric_view else {}
     synthetic = dump_yaml(
         {
             "cubes": [
@@ -153,7 +155,7 @@ def _convert_cube_view_to_ossie_with_provenance(
     )
     model = load_yaml(ossie_yaml, "projected Ossie model")["semantic_model"][0]
 
-    provenance = _apply_projection(model, projected_cubes, selected, carriers)
+    provenance = _apply_projection(model, projected_cubes, selected, carriers, metric_view)
     issues = _publication_issues(collection_issues, conversion_issues, selected, required_cubes)
     if strict_fanout:
         unsafe = issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)
@@ -921,6 +923,20 @@ class _DimensionResolver:
     def has_dimension(self, cube_name, member_name):
         return (cube_name, member_name) in self._dimensions
 
+    def reads_other_cube(self, cube_name, member_name, stack=()):
+        """Whether a dimension reads another cube, directly or through its own dimensions."""
+
+        marker = (cube_name, member_name)
+        if marker in stack:
+            return False
+        for text in _dimension_expression_texts(self._dimensions[marker]):
+            for kind, target in _cube_references(text, cube_name, self._cubes):
+                if kind == "dataset" or target[0] != cube_name:
+                    return True
+                if target in self._dimensions and self.reads_other_cube(*target, stack + (marker,)):
+                    return True
+        return False
+
     def join_condition(self, own_cube, target, sql):
         """A join's Cube SQL with every column qualified by its cube's dataset marker."""
 
@@ -1018,8 +1034,6 @@ class _DimensionResolver:
             reject_cross=not qualified,
             scope=f"{stack[0][0]}.{stack[0][1]}",
         )
-        if qualified:
-            prepared = qualify_bare_columns(prepared)
         out, _ = cube_sql_to_ossie(
             prepared,
             cube_name,
@@ -1153,7 +1167,6 @@ class _PublicationMeasureResolver(_MeasureResolver):
             reject_cross=False,
             scope=f"{cname}.{stack[0][1] if stack else '<unknown>'}",
         )
-        prepared = qualify_bare_columns(prepared)
 
         def resolve(body):
             head, dot, rest = body.partition(".")
@@ -1188,13 +1201,14 @@ class _PublicationMeasureResolver(_MeasureResolver):
         )
 
 
-def _apply_projection(model, cubes, selected, carriers):
+def _apply_projection(model, cubes, selected, carriers, metric_view):
     datasets = {dataset["name"]: dataset for dataset in model.get("datasets") or []}
     metrics = {metric["name"]: metric for metric in model.get("metrics") or []}
 
     pk_by_cube = {name: _primary_key_of(cube, name) for name, cube in cubes.items()}
     resolver_issues = IssueLog()
     dataset_markers = _dataset_markers(cubes)
+    dataset_names = {marker: cube_name for cube_name, marker in dataset_markers.items()}
     dim_resolver = _DimensionResolver(cubes, dataset_markers)
     join_conditions = {
         carrier: (
@@ -1223,6 +1237,7 @@ def _apply_projection(model, cubes, selected, carriers):
     projected_fields = {name: [] for name in datasets}
     projected_metrics = []
     metric_templates = {}
+    dimension_templates = {}
     for member in selected:
         if member.kind == "dimension":
             fields = {field["name"]: field for field in datasets[member.cube].get("fields") or []}
@@ -1233,9 +1248,20 @@ def _apply_projection(model, cubes, selected, carriers):
                 )
             item = copy.deepcopy(fields[member.source_name])
             item["name"] = member.output_name
-            item["expression"]["dialects"][0]["expression"] = dim_resolver.expression(
-                member.cube, member.source_name
-            )
+            if metric_view and dim_resolver.reads_other_cube(member.cube, member.source_name):
+                # A Metric View dimension can read any joined table, so this one keeps
+                # each column's dataset and bridge.py renders it against join aliases.
+                template = dim_resolver.expression(member.cube, member.source_name, qualified=True)
+                dimension_templates[member.output_name] = template
+                expression = _render_dataset_markers(template, dataset_names)
+                # The Cube converter kept the SQL it could not convert; this replaces it.
+                stash = read_stash(item)
+                stash.pop("sql", None)
+                _drop_cube_extension(item)
+                write_stash(item, stash)
+            else:
+                expression = dim_resolver.expression(member.cube, member.source_name)
+            item["expression"]["dialects"][0]["expression"] = expression
             _apply_override(item, member)
             projected_fields[member.cube].append(item)
         else:
@@ -1260,8 +1286,7 @@ def _apply_projection(model, cubes, selected, carriers):
             template = measure_resolver.inlined(*key)
             metric_templates[member.output_name] = template
             item["expression"]["dialects"][0]["expression"] = _render_dataset_markers(
-                template,
-                {marker: cube_name for cube_name, marker in dataset_markers.items()},
+                template, dataset_names
             )
             _apply_override(item, member)
             projected_metrics.append(item)
@@ -1298,6 +1323,7 @@ def _apply_projection(model, cubes, selected, carriers):
 
     return _ProjectionProvenance(
         metric_templates,
+        dimension_templates,
         dataset_markers,
         dataset_data_sources,
         join_conditions,
