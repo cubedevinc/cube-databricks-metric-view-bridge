@@ -162,7 +162,14 @@ def _convert_cube_view_to_ossie_with_provenance(
     model = load_yaml(ossie_yaml, "projected Ossie model")["semantic_model"][0]
 
     provenance = _apply_projection(model, projected_cubes, selected, carriers, metric_view)
-    issues = _publication_issues(collection_issues, conversion_issues, selected, required_cubes)
+    source_grain = (
+        _source_grain_measures(cubes, projected_cubes, resolved_source, needed_measures)
+        if metric_view and resolved_source == paths[0][0]
+        else frozenset()
+    )
+    issues = _publication_issues(
+        collection_issues, conversion_issues, selected, required_cubes, source_grain
+    )
     if strict_fanout:
         unsafe = issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)
         if unsafe:
@@ -1687,12 +1694,37 @@ def _drop_cube_extension(item):
         item.pop("custom_extensions", None)
 
 
-def _publication_issues(collection, conversion, selected, required):
+def _source_grain_measures(cubes, projected, source, measures):
+    """The measures a Metric View aggregates once per source row, as Cube does.
+
+    The Cube converter refuses any non-idempotent aggregate that reads a cube on the
+    one side of a many-to-one join, since it judges the model with no source. A Metric
+    View's rows are its source's rows, and with only many-to-one and one-to-one joins
+    none repeats, so a measure of the source cube is safe whatever joined columns it
+    reads, provided every measure it references is also on the source cube.
+    """
+
+    to_one = ("many_to_one", "one_to_one")
+    for cube_name, cube in projected.items():
+        for join in _as_named_list(cube.get("joins"), f"cube '{cube_name}' joins"):
+            if _RELATIONSHIP_ALIASES.get(snake(str(join.get("relationship") or ""))) not in to_one:
+                return frozenset()
+    return frozenset(
+        f"{source}.{measure_name}"
+        for cube_name, measure_name in measures
+        if cube_name == source
+        and all(owner == source for owner, _ in _measure_closure(cubes, {(source, measure_name)}))
+    )
+
+
+def _publication_issues(collection, conversion, selected, required, source_grain):
     wanted = {f"{member.cube}.{member.source_name}" for member in selected}
     out = IssueLog()
     for issues, is_conversion in ((collection, False), (conversion, True)):
         for issue in issues:
             element = issue.element_name
+            if issue.issue_type == IssueType.FANOUT_UNSAFE_METRIC and element in source_grain:
+                continue
             member_issue = any(element == name for name in wanted)
             cube_issue = any(element == f"cube '{name}'" for name in required)
             join_issue = element.startswith("join '")
