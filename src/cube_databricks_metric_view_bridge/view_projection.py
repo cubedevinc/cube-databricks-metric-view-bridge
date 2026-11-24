@@ -425,15 +425,20 @@ def _project_cubes(cubes, required, joins, needed_measures):
             # _measure_closure admits multi_stage only on a calculated measure with no
             # stage modifier; the Ossie converter would otherwise park it.
             measure.pop("multi_stage", None)
-        if isinstance(cube.get("sql"), str):
-            cube["sql"] = _inline_cube_sql(cube["sql"], cubes, (cube_name,))
+        for key in ("sql", "sql_table"):
+            if isinstance(cube.get(key), str):
+                cube[key] = _inline_cube_sql(cube[key], cubes, (cube_name,))
         projected[cube_name] = cube
     return projected
 
 
 _CUBE_SQL_CALL_RE = re.compile(r"\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*sql\s*\(\s*\)\s*\}")
+# A '.sql()' call left after expansion, such as one on a join path ('{a.b.sql()}').
+_CUBE_SQL_ANY_CALL_RE = re.compile(r"\{[^{}]*\.\s*sql\s*\(\s*\)\s*\}")
 # Cube's BaseQuery.cubeSql reads a cube whose SQL is a bare 'select * from <table>' as the table.
 _SELECT_STAR_FROM_RE = re.compile(r"^\s*select\s+\*\s+from\s+([a-zA-Z0-9_\-`\".*]+)\s*$", re.I)
+# Cube YAML writes a literal brace as '\{' or '\}'.
+_ESCAPED_BRACE_RE = re.compile(r"\\[{}]")
 
 
 def _inline_cube_sql(sql, cubes, stack):
@@ -445,16 +450,23 @@ def _inline_cube_sql(sql, cubes, stack):
 
     whole = _CUBE_SQL_CALL_RE.fullmatch(sql.strip())
     if whole:
-        return _referenced_cube_sql(whole.group(1), cubes, stack)[0]
+        result = _referenced_cube_sql(whole.group(1), cubes, stack)[0]
+    else:
 
-    def expand(match):
-        text, is_table = _referenced_cube_sql(match.group(1), cubes, stack)
-        if is_table:
-            return text
-        select_star = _SELECT_STAR_FROM_RE.match(text)
-        return select_star.group(1) if select_star else f"({text})"
+        def expand(match):
+            text, is_table = _referenced_cube_sql(match.group(1), cubes, stack)
+            if is_table:
+                return text
+            select_star = _SELECT_STAR_FROM_RE.match(text)
+            return select_star.group(1) if select_star else f"({text})"
 
-    return _CUBE_SQL_CALL_RE.sub(expand, sql)
+        result = _CUBE_SQL_CALL_RE.sub(expand, sql)
+    if left := _CUBE_SQL_ANY_CALL_RE.search(result):
+        raise ConversionError(
+            f"cube '{stack[-1]}' reads '{left.group(0)}', which names a join path; "
+            "reference the cube itself, as in '{other_cube.sql()}'"
+        )
+    return result
 
 
 def _referenced_cube_sql(target, cubes, stack):
@@ -462,6 +474,8 @@ def _referenced_cube_sql(target, cubes, stack):
 
     referrer = stack[-1]
     reference = f"{{{target}.sql()}}"
+    if target in ("CUBE", "TABLE"):
+        target = referrer
     if target in stack:
         chain = " -> ".join((*stack, target))
         raise ConversionError(f"cube '{referrer}' reads {reference} in a cycle: {chain}")
@@ -470,17 +484,10 @@ def _referenced_cube_sql(target, cubes, stack):
         raise ConversionError(
             f"cube '{referrer}' reads {reference}, but cube '{target}' is not in the model"
         )
-    target_source = cube.get("data_source", "default")
-    referrer_source = cubes[referrer].get("data_source", "default")
-    if target_source != referrer_source:
-        raise ConversionError(
-            f"cube '{referrer}' reads {reference} from data source '{target_source}', "
-            f"but its own data source is '{referrer_source}'"
-        )
 
-    table = cube.get("sql_table")
-    if table is not None:
-        text, is_table = str(table), True
+    if isinstance(cube.get("sql_table"), str):
+        text = _inline_cube_sql(cube["sql_table"], cubes, (*stack, target))
+        is_table = True
     elif isinstance(cube.get("sql"), str):
         text = _inline_cube_sql(cube["sql"], cubes, (*stack, target))
         is_table = False
@@ -488,7 +495,7 @@ def _referenced_cube_sql(target, cubes, stack):
         raise ConversionError(f"cube '{referrer}' reads {reference}, but '{target}' has no SQL")
     # Cube resolves the rest of the referenced SQL ({CUBE}, members, context) as that
     # cube; inlined into another cube's source, the same text would mean something else.
-    if leftover := _CUBE_REF_RE.search(text):
+    if leftover := _CUBE_REF_RE.search(_ESCAPED_BRACE_RE.sub("", text)):
         raise ConversionError(
             f"cube '{referrer}' reads {reference}, whose SQL uses '{leftover.group(0)}', "
             "which only Cube can resolve"
