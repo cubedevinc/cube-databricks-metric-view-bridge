@@ -88,6 +88,16 @@ intermediate Ossie artifact of
 on a carrier column, since an Ossie relationship holds only column equalities;
 `convert_cube_view_to_ossie` leaves the join out, as the Cube converter does.
 
+A cube `sql` or `sql_table` that reads another cube's SQL through
+`{other_cube.sql()}` is expanded the way Cube compiles it, so the dataset source is
+plain SQL: the referenced cube's `sql_table` as written, or its `sql` in parentheses
+(just the table when that SQL is a bare `select * from <table>`), with references
+inside it expanded first. A cube whose whole `sql` is one reference takes that
+source. A reference is rejected when it is part of a cycle, names a cube missing
+from the input, goes through a join path (`{orders.users.sql()}`), or leads to SQL
+that uses any other Cube template (`{CUBE}`, a member, query context), which Cube
+resolves as the referenced cube. Escaped braces (`\{`, `\}`) are literal text.
+
 Cube data source ownership and physical relation completion are explicit inputs.
 When `expected_data_source` is supplied, every projected and hidden dependency
 cube must use that Cube data source (`default` when `data_source` is omitted).
