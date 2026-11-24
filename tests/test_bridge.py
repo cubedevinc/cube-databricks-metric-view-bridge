@@ -6,6 +6,7 @@
 """End-to-end contract tests for the Cube-owned bridge boundary."""
 
 import dataclasses
+import re
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -1541,6 +1542,62 @@ def test_aggregate_measure_reading_a_measure_is_refused(reference):
         _convert(model)
 
 
+def _with_number_measure(sql):
+    return _JOINED_DIMENSION_MODEL.replace(
+        "      - {name: count, type: count}\n",
+        "      - {name: count, type: count}\n"
+        f'      - {{name: tiered, type: number, sql: "{sql}"}}\n',
+    ).replace("includes: [status,", "includes: [tiered, status,")
+
+
+@pytest.mark.parametrize(
+    ("condition", "column"),
+    [
+        ("{users.tier} = 'gold'", "users.tier"),
+        ("{status} = 'paid'", "source.status"),
+        ("{CUBE}.status = 'paid'", "source.status"),
+    ],
+)
+def test_number_measure_reading_a_column_outside_an_aggregate_is_refused(condition, column):
+    # Cube runs it only when that column is also grouped by; Databricks rejects it outright.
+    model = _with_number_measure(f"CASE WHEN {condition} THEN {{count}} ELSE 0 END")
+
+    with pytest.raises(
+        ConversionError,
+        match=rf"measure 'tiered' reads {re.escape(column)} outside an aggregate.*"
+        "move the condition inside the aggregate",
+    ):
+        _convert(model)
+
+
+def test_number_measure_with_the_condition_inside_the_aggregate_publishes():
+    model = _with_number_measure(
+        "COUNT(DISTINCT CASE WHEN {users.tier} = 'gold' THEN {CUBE}.id END) / NULLIF({count}, 0)"
+    )
+
+    measures = {
+        item["name"]: item["expr"]
+        for item in yaml.safe_load(_convert(model).metric_view_yaml)["measures"]
+    }
+
+    assert measures["tiered"] == (
+        "COUNT(DISTINCT CASE WHEN users.tier = 'gold' THEN source.id END) "
+        "/ NULLIF(COUNT(DISTINCT source.id), 0)"
+    )
+
+
+def test_boolean_measure_with_the_any_aggregate_publishes():
+    model = _JOINED_DIMENSION_MODEL.replace(
+        "      - {name: count, type: count}\n",
+        "      - {name: count, type: count}\n"
+        "      - {name: any_paid, type: boolean, sql: \"ANY({CUBE}.status = 'paid')\"}\n",
+    ).replace("includes: [status,", "includes: [any_paid, status,")
+
+    measures = yaml.safe_load(_convert(model).metric_view_yaml)["measures"]
+
+    assert {"name": "any_paid", "expr": "ANY(source.status = 'paid')"} in measures
+
+
 def test_plain_reference_does_not_follow_a_path_another_member_named():
     # Cube joins `{users.tier}` alone along the shortest path, orders -> users, so
     # a plain reference stays ambiguous here whatever path another member names.
@@ -1766,3 +1823,87 @@ def test_dimension_with_a_top_level_operator_keeps_its_precedence_inside_a_measu
         "(source.status = 'open' OR source.status = 'new') AND source.tax > 0"
         in (expressions["open_count"])
     )
+
+
+_SOURCE_COLUMN_MODEL = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - name: users
+        relationship: many_to_one
+        sql: "{CUBE}.source = 'web' AND {CUBE}.user_id = {users}.id"
+    dimensions:
+      - {name: source, sql: source, type: string}
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: placed_at, sql: placed_at, type: time}
+    measures:
+      - {name: count, type: count}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: tier, sql: tier, type: string}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [source, id, placed_at, count]}
+      - {join_path: orders.users, includes: [tier]}
+"""
+
+
+def _dimensions(result):
+    return [
+        (item["name"], item["expr"])
+        for item in yaml.safe_load(result.metric_view_yaml)["dimensions"]
+    ]
+
+
+def test_a_dimension_named_source_follows_the_dimensions_that_read_the_source():
+    # Databricks binds `source.id` in a later dimension to the dimension `source`.
+    assert _dimensions(_convert(_SOURCE_COLUMN_MODEL)) == [
+        ("id", "source.id"),
+        ("placed_at", "source.placed_at"),
+        ("tier", "users.tier"),
+        ("source", "source.source"),
+    ]
+
+
+def test_a_dimension_named_like_a_join_follows_the_dimensions_that_read_the_join():
+    model = _SOURCE_COLUMN_MODEL.replace(
+        "includes: [source, id, placed_at, count]",
+        "includes: [{name: source, alias: users}, id, count]",
+    )
+
+    assert _dimensions(_convert(model)) == [
+        ("id", "source.id"),
+        ("tier", "users.tier"),
+        ("users", "source.source"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "includes",
+    ["[source, {name: id, alias: users}, count]", "[{name: id, alias: users}, source, count]"],
+)
+def test_a_dimension_named_like_a_join_that_reads_the_source_comes_before_source(includes):
+    # `users` reads `source.id`, so it must precede `source`; `source` reads only itself.
+    model = _SOURCE_COLUMN_MODEL.replace(
+        "includes: [source, id, placed_at, count]", f"includes: {includes}"
+    )
+
+    assert _dimensions(_convert(model)) == [
+        ("tier", "users.tier"),
+        ("users", "source.id"),
+        ("source", "source.source"),
+    ]
+
+
+def test_dimensions_that_each_read_the_others_name_are_refused():
+    model = _SOURCE_COLUMN_MODEL.replace(
+        "includes: [source, id, placed_at, count]",
+        "includes: [{name: id, alias: users}, count]",
+    ).replace("includes: [tier]", "includes: [{name: tier, alias: source}]")
+
+    with pytest.raises(ConversionError, match="dimensions 'users', 'source' each read another's"):
+        _convert(model)

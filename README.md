@@ -63,6 +63,11 @@ are. A Metric View dimension must have one value per source row, so one that rea
 table behind a one-to-many join is rejected. `convert_cube_view_to_ossie` still
 rejects such a dimension, since an Ossie field reads only its own dataset.
 
+A Metric View dimension can read the dimensions before it by name, and Databricks binds
+`source.id` in a later dimension to an earlier dimension named `source`, not to the
+source; a dimension named like a join does the same. Such a dimension is emitted after
+the others, and a view where two of them read each other's names is rejected.
+
 A reference through a join path from the member's own cube, such as
 `{CUBE.users.tier}` on `orders` or `{orders.users.countries.name}`, reads the last
 cube's member joined along that path, as Cube does, so it publishes as `users.tier`.
@@ -75,6 +80,12 @@ An aggregate measure such as `count_distinct` or `max` whose SQL or filters read
 measure that aggregates is rejected: SQL cannot nest one aggregate in another.
 Reference a dimension instead. A calculated measure (`type: number`) can still combine
 measures, and an aggregate over a row-level calculated measure is published.
+
+A measure that reads a column outside any aggregate, such as
+`CASE WHEN {users.tier} = 'gold' THEN {count} END`, is rejected. Cube computes it only
+when that column is grouped by, and a Metric View measure must aggregate every column
+it reads. Put the condition inside the aggregate, as in
+`COUNT(CASE WHEN {users.tier} = 'gold' THEN {CUBE}.id END)`.
 
 A join whose condition is not a plain column equality, such as a range on effective
 dates (SCD2), an expression like `CAST(...)` or `date_trunc(...)`, or a comparison

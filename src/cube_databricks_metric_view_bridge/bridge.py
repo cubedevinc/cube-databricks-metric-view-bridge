@@ -154,6 +154,7 @@ def convert_cube_view_to_databricks_metric_view(
         {"measures": provenance.metric_templates, "dimensions": provenance.dimension_templates},
         provenance.dataset_markers,
     )
+    metric_view_yaml = _order_shadowing_dimensions(metric_view_yaml)
     _validate_public_surface(normalized, metric_view_yaml)
     unhandled_warnings = [
         message
@@ -622,6 +623,14 @@ def _apply_expression_templates(
             item["expr"] = _render_metric_template(
                 template, marker_paths, f"{kind} '{name}'", outer_columns, outer_prefix
             )
+            column = _unaggregated_column(item["expr"]) if collection == "measures" else None
+            if column is not None:
+                raise ConversionError(
+                    f"measure '{name}' reads {column} outside an aggregate, which Cube "
+                    "computes only when that column is grouped by and a Metric View "
+                    "measure cannot read; move the condition inside the aggregate, or "
+                    "leave the measure out of the view"
+                )
     if outer_columns:
         columns = ", ".join(f"{column} AS {name}" for column, name in outer_columns.items())
         source_sql = str(metric_view["source"]).strip()
@@ -629,6 +638,102 @@ def _apply_expression_templates(
             source_sql = f"({source_sql}) AS {outer_prefix}source__"
         metric_view["source"] = f"SELECT *, {columns} FROM {source_sql}"
     return dump_databricks_yaml(metric_view)
+
+
+def _order_shadowing_dimensions(metric_view_yaml):
+    """Emit a dimension named like the source or a join after the dimensions that read it.
+
+    A Metric View dimension can read the dimensions before it by name, and Databricks
+    binds `source.col` in a later dimension to an earlier dimension named `source`
+    rather than to the source, so the CREATE fails. A join's name does the same.
+    """
+
+    metric_view = load_databricks_yaml(metric_view_yaml)
+    if not isinstance(metric_view, dict) or not isinstance(metric_view.get("dimensions"), list):
+        return metric_view_yaml
+    qualifiers = {"source", *(name.casefold() for name in _join_names(metric_view.get("joins")))}
+
+    def shadows(item):
+        return isinstance(item, dict) and str(item.get("name", "")).casefold() in qualifiers
+
+    dimensions = metric_view["dimensions"]
+    pending = [item for item in dimensions if shadows(item)]
+    if not pending:
+        return metric_view_yaml
+    reads = {id(item): _qualifier_heads(item.get("expr")) for item in pending}
+    ordered = [item for item in dimensions if not shadows(item)]
+    while pending:
+        # The first one no other pending dimension reads; its readers are already placed.
+        ready = next(
+            (
+                item
+                for item in pending
+                if not any(
+                    other is not item and str(item["name"]).casefold() in reads[id(other)]
+                    for other in pending
+                )
+            ),
+            None,
+        )
+        if ready is None:
+            names = ", ".join(f"'{item['name']}'" for item in pending)
+            raise ConversionError(
+                f"dimensions {names} each read another's name, which Databricks binds to "
+                "that dimension in a Metric View whatever their order; rename one in the view"
+            )
+        ordered.append(ready)
+        pending.remove(ready)
+    metric_view["dimensions"] = ordered
+    return dump_databricks_yaml(metric_view)
+
+
+def _join_names(joins):
+    for join in joins or []:
+        if isinstance(join, dict):
+            yield str(join.get("name", ""))
+            yield from _join_names(join.get("joins"))
+
+
+def _qualifier_heads(expression):
+    """The first part of every qualified column ``expression`` reads, casefolded."""
+
+    return {
+        column.parts[0].name.casefold()
+        for column in _parse_rendered(expression, "dimension").find_all(exp.Column)
+        if len(column.parts) > 1
+    }
+
+
+def _parse_rendered(expression, kind):
+    try:
+        return parse_one(str(expression), read="databricks")
+    except SqlglotError as error:
+        raise ConversionError(
+            f"{kind} expression cannot be safely parsed for publication: {error}"
+        ) from error
+
+
+# A column under one of these is aggregated, binds to a subquery's own FROM, or sits
+# in a function sqlglot does not know, which may be an aggregate. sqlglot reads
+# Databricks' `any(expr)` aggregate as `exp.Any`.
+_AGGREGATING_SCOPES = (
+    exp.AggFunc,
+    exp.Any,
+    exp.Filter,
+    exp.WithinGroup,
+    exp.Window,
+    exp.Query,
+    exp.Anonymous,
+)
+
+
+def _unaggregated_column(expression):
+    """The first column a measure expression reads outside any aggregate, as SQL."""
+
+    for column in _parse_rendered(expression, "measure").find_all(exp.Column):
+        if column.find_ancestor(*_AGGREGATING_SCOPES) is None:
+            return column.sql(dialect="databricks")
+    return None
 
 
 def _one_to_many_join_paths(joins, parent=(), under_one_to_many=False):
