@@ -47,6 +47,12 @@ drop a selected dimension through a one-to-many path. Joined computed dimensions
 are published only when the bridge can qualify every column safely; ambiguous SQL
 fails closed rather than returning a potentially publishable artifact.
 
+A dimension that reads another cube, such as `sql: "{users.name}"` on `orders`, is
+published with each column qualified by its join path (`users.name`), as metrics
+are. A Metric View dimension must have one value per source row, so one that reads a
+table behind a one-to-many join is rejected. `convert_cube_view_to_ossie` still
+rejects such a dimension, since an Ossie field reads only its own dataset.
+
 A join whose condition is not a plain column equality, such as a range on effective
 dates (SCD2), an expression like `CAST(...)` or `date_trunc(...)`, or a comparison
 with a literal or keyword like `true` or `current_date`, is published with its Cube

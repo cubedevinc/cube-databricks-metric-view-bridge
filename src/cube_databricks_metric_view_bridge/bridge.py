@@ -109,7 +109,7 @@ def convert_cube_view_to_databricks_metric_view(
             view,
             source=source,
             strict_fanout=strict_fanout,
-            carry_join_conditions=True,
+            metric_view=True,
         )
     )
     document = yaml.safe_load(projected)
@@ -140,23 +140,25 @@ def convert_cube_view_to_databricks_metric_view(
     )
     metric_view_yaml = _restore_converter_sources(metric_view_yaml, converter_sources)
 
+    templated_fields = frozenset(name.casefold() for name in provenance.dimension_templates)
     metric_view_yaml, qualified_fields = _qualify_joined_computed_dimensions(
         normalized,
         metric_view_yaml,
         resolved_source,
+        templated_fields,
     )
-    metric_view_yaml = _apply_metric_expression_templates(
+    metric_view_yaml = _apply_expression_templates(
         normalized,
         metric_view_yaml,
         resolved_source,
-        provenance.metric_templates,
+        {"measures": provenance.metric_templates, "dimensions": provenance.dimension_templates},
         provenance.dataset_markers,
     )
     _validate_public_surface(normalized, metric_view_yaml)
     unhandled_warnings = [
         message
         for message in caught
-        if not _is_handled_joined_expression_warning(message, qualified_fields)
+        if not _is_handled_joined_expression_warning(message, qualified_fields | templated_fields)
     ]
     unsafe_dimensions = [
         message for message in unhandled_warnings if _JOINED_COMPLEX_WARNING.fullmatch(message)
@@ -447,6 +449,7 @@ def _qualify_joined_computed_dimensions(
     ossie_yaml: str,
     metric_view_yaml: str,
     source: str,
+    templated_fields: frozenset[str],
 ) -> tuple[str, frozenset[str]]:
     """Finish a known gap in the pinned Ossie Databricks converter.
 
@@ -479,7 +482,7 @@ def _qualify_joined_computed_dimensions(
             continue
         for field in dataset.get("fields") or []:
             field_name = field.get("name")
-            if not isinstance(field_name, str):
+            if not isinstance(field_name, str) or field_name.casefold() in templated_fields:
                 continue
             dimension = dimensions.get(field_name.casefold())
             if dimension is None or not isinstance(dimension.get("expr"), str):
@@ -560,14 +563,14 @@ def _dataset_qualifiers(model: dict, source: str) -> dict[str, str]:
     return {name: ".".join(path) for name, path in paths.items() if path}
 
 
-def _apply_metric_expression_templates(
+def _apply_expression_templates(
     ossie_yaml: str,
     metric_view_yaml: str,
     source: str,
-    templates: dict[str, str],
+    templates: dict[str, dict[str, str]],
     dataset_markers: dict[str, str],
 ) -> str:
-    """Render provenance-bearing metric templates against emitted join aliases."""
+    """Render provenance-bearing measure and dimension templates against emitted join aliases."""
 
     document = yaml.safe_load(ossie_yaml)
     model = document["semantic_model"][0]
@@ -575,11 +578,6 @@ def _apply_metric_expression_templates(
     metric_view = load_databricks_yaml(metric_view_yaml)
     if not isinstance(metric_view, dict):
         raise ConversionError("Databricks converter returned a non-mapping Metric View")
-    measures = {
-        str(item.get("name", "")).casefold(): item
-        for item in metric_view.get("measures") or []
-        if isinstance(item, dict)
-    }
     marker_paths = {}
     for dataset, marker in dataset_markers.items():
         if dataset == source:
@@ -591,14 +589,48 @@ def _apply_metric_expression_templates(
                 f"dataset '{dataset}' has no emitted Metric View join path from source '{source}'"
             )
 
-    for name, template in templates.items():
-        measure = measures.get(name.casefold())
-        if measure is None or not isinstance(measure.get("expr"), str):
-            raise ConversionError(
-                f"Databricks converter dropped selected metric '{name}'; refusing publication"
-            )
-        measure["expr"] = _render_metric_template(template, marker_paths, f"metric '{name}'")
+    one_to_many = _one_to_many_join_paths(metric_view.get("joins"))
+    for collection, kind in (("measures", "metric"), ("dimensions", "dimension")):
+        items = {
+            str(item.get("name", "")).casefold(): item
+            for item in metric_view.get(collection) or []
+            if isinstance(item, dict)
+        }
+        for name, template in templates[collection].items():
+            item = items.get(name.casefold())
+            if item is None or not isinstance(item.get("expr"), str):
+                raise ConversionError(
+                    f"Databricks converter dropped selected {kind} '{name}'; refusing publication"
+                )
+            if collection == "dimensions":
+                for marker, path in marker_paths.items():
+                    if path in one_to_many and re.search(
+                        rf"(?<![A-Za-z0-9_]){re.escape(marker)}(?![A-Za-z0-9_])",
+                        template,
+                        re.IGNORECASE,
+                    ):
+                        raise ConversionError(
+                            f"dimension '{name}' reads join '{'.'.join(path)}', which is "
+                            "one-to-many; a Metric View dimension must have one value per "
+                            "source row"
+                        )
+            item["expr"] = _render_metric_template(template, marker_paths, f"{kind} '{name}'")
     return dump_databricks_yaml(metric_view)
+
+
+def _one_to_many_join_paths(joins, parent=(), under_one_to_many=False):
+    """Alias paths of the joins Databricks reaches through a one-to-many join."""
+
+    paths = set()
+    for join in joins or []:
+        if not isinstance(join, dict):
+            continue
+        path = parent + (str(join.get("name")),)
+        one_to_many = under_one_to_many or join.get("cardinality") == "one_to_many"
+        if one_to_many:
+            paths.add(path)
+        paths |= _one_to_many_join_paths(join.get("joins"), path, one_to_many)
+    return paths
 
 
 def _render_metric_template(expression, marker_paths, scope):

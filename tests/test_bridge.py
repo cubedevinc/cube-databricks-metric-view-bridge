@@ -944,3 +944,168 @@ def test_condition_member_reading_a_cube_outside_the_view_is_refused():
 
     with pytest.raises(ConversionError, match="reads 'segments.code'"):
         _convert(model)
+
+
+_JOINED_DIMENSION_MODEL = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: status, sql: status, type: string}
+      - {name: user_name, sql: "{users.name}", type: string}
+      - {name: user_tier, sql: "{users}.tier", type: string}
+      - name: label
+        sql: "CONCAT({CUBE}.status, ' / ', COALESCE({users.name}, 'n/a'))"
+        type: string
+      - {name: shouted_name, sql: "UPPER({user_name})", type: string}
+      - {name: country, sql: "{users.country_name}", type: string}
+    measures:
+      - {name: count, type: count}
+  - name: users
+    sql_table: main.sales.users
+    joins:
+      - {name: countries, sql: "{CUBE}.country_id = {countries}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: name, sql: name, type: string}
+      - {name: tier, sql: tier, type: string}
+      - {name: country_name, sql: "{countries.name}", type: string}
+  - name: countries
+    sql_table: main.sales.countries
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: name, sql: name, type: string}
+views:
+  - name: sales
+    cubes:
+      - join_path: orders
+        includes: [status, user_name, user_tier, label, shouted_name, country, count]
+"""
+
+
+def _dimension_expressions(result):
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    return {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+
+
+def test_dimension_reading_a_joined_cube_is_published_through_its_join():
+    result = _convert(_JOINED_DIMENSION_MODEL)
+    expressions = _dimension_expressions(result)
+
+    assert expressions == {
+        "status": "source.status",
+        "user_name": "users.name",
+        "user_tier": "users.tier",
+        "label": "CONCAT(source.status, ' / ', COALESCE(users.name, 'n/a'))",
+        "shouted_name": "UPPER(users.name)",
+        "country": "users.countries.name",
+    }
+    joins = _joins_by_name(yaml.safe_load(result.metric_view_yaml))
+    assert set(joins) == {"users", "countries"}
+    # The Cube converter's stash of the unconverted SQL is gone, so no field warns.
+    assert not [issue for issue in result.issues if "[field " in issue.message]
+    # The intermediate Ossie field keeps each column's dataset.
+    fields = {
+        field["name"]: field["expression"]["dialects"][0]["expression"]
+        for dataset in yaml.safe_load(result.ossie_yaml)["semantic_model"][0]["datasets"]
+        for field in dataset.get("fields") or []
+    }
+    assert fields["label"] == "CONCAT(orders.status, ' / ', COALESCE(users.name, 'n/a'))"
+
+
+def test_joined_dataset_dimension_reading_a_deeper_cube_uses_both_join_paths():
+    model = _JOINED_DIMENSION_MODEL.replace(
+        '      - {name: country_name, sql: "{countries.name}", type: string}',
+        '      - {name: country_name, sql: "{countries.name}", type: string}\n'
+        "      - name: tier_country\n"
+        "        sql: \"CONCAT({CUBE}.tier, '@', {countries.name})\"\n"
+        "        type: string",
+    ).replace(
+        "includes: [status, user_name, user_tier, label, shouted_name, country, count]",
+        "includes: [status, count]\n      - {join_path: orders.users, includes: [tier_country]}",
+    )
+
+    expressions = _dimension_expressions(_convert(model))
+
+    assert expressions["tier_country"] == "CONCAT(users.tier, '@', users.countries.name)"
+
+
+def test_dimension_reading_a_one_to_many_join_is_refused():
+    model = (
+        _JOINED_DIMENSION_MODEL.replace(
+            "relationship: many_to_one}\n    dimensions:\n      - {name: id, sql: id, type: number, primary_key: true}\n      - {name: status",
+            "relationship: many_to_one}\n"
+            '      - {name: items, sql: "{CUBE}.id = {items}.order_id", relationship: one_to_many}\n'
+            "    dimensions:\n      - {name: id, sql: id, type: number, primary_key: true}\n"
+            '      - {name: item_sku, sql: "{items.sku}", type: string}\n      - {name: status',
+        )
+        .replace(
+            "views:",
+            "  - name: items\n"
+            "    sql_table: main.sales.items\n"
+            "    dimensions:\n"
+            "      - {name: id, sql: id, type: number, primary_key: true}\n"
+            "      - {name: sku, sql: sku, type: string}\n"
+            "views:",
+        )
+        .replace("includes: [status, user_name,", "includes: [item_sku, status, user_name,")
+    )
+
+    with pytest.raises(ConversionError, match="reads join 'items', which is one-to-many"):
+        _convert(model)
+
+
+def test_dimension_reading_a_joined_cube_keeps_its_presentation_metadata():
+    model = _JOINED_DIMENSION_MODEL.replace(
+        '      - {name: user_tier, sql: "{users}.tier", type: string}\n',
+        '      - {name: user_tier, sql: "{users}.tier", type: string, format: link}\n',
+    )
+
+    result = _convert(model)
+    fields = {
+        field["name"]: field
+        for dataset in yaml.safe_load(result.ossie_yaml)["semantic_model"][0]["datasets"]
+        for field in dataset.get("fields") or []
+    }
+
+    assert [extension["data"] for extension in fields["user_tier"]["custom_extensions"]] == [
+        '{"_v": 1, "format": "link"}'
+    ]
+
+
+def test_date_units_stay_units_in_dimensions_and_measures_reading_joined_cubes():
+    model = (
+        _JOINED_DIMENSION_MODEL.replace(
+            "      - {name: status, sql: status, type: string}\n",
+            "      - {name: status, sql: status, type: string}\n"
+            "      - name: days_since_signup\n"
+            '        sql: "DATEDIFF(DAY, {users.created_at}, {CUBE}.created_at)"\n'
+            "        type: number\n",
+        )
+        .replace(
+            "      - {name: count, type: count}\n",
+            "      - {name: count, type: count}\n"
+            "      - name: signup_hours\n"
+            '        sql: "TIMESTAMPDIFF(HOUR, {CUBE}.created_at, {CUBE}.shipped_at)"\n'
+            "        type: sum\n",
+        )
+        .replace(
+            "      - {name: tier, sql: tier, type: string}\n",
+            "      - {name: tier, sql: tier, type: string}\n"
+            "      - {name: created_at, sql: created_at, type: time}\n",
+        )
+        .replace("includes: [status,", "includes: [days_since_signup, signup_hours, status,")
+    )
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+
+    assert _dimension_expressions(result)["days_since_signup"] == (
+        "DATEDIFF(DAY, users.created_at, source.created_at)"
+    )
+    assert {item["name"]: item["expr"] for item in metric_view["measures"]}["signup_hours"] == (
+        "SUM(TIMESTAMPDIFF(HOUR, source.created_at, source.shipped_at))"
+    )
