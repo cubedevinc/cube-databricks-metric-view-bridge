@@ -1475,7 +1475,8 @@ class _PublicationMeasureResolver(_MeasureResolver):
         def resolve(body):
             target = target_of(body)
             if target is not None and self._dimensions.has_dimension(*target):
-                return self._dimensions.expression(*target, qualified=True)
+                inner = self._dimensions.expression(*target, qualified=True)
+                return f"({inner})" if has_top_level_operator(inner) else inner
             if (
                 target is not None
                 and stack

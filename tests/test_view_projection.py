@@ -938,7 +938,7 @@ views:
         ("users", "profiles"),
     ]
     assert expr_of(by_name(model["metrics"])["max_adjusted_score"]) == (
-        "MAX(profiles.base_score * users.multiplier)"
+        "MAX((profiles.base_score * users.multiplier))"
     )
 
     result = convert_cube_view_to_databricks_metric_view({"model.yml": text}, "sales")
@@ -946,7 +946,7 @@ views:
     assert metric_view["joins"][0]["name"] == "users"
     assert metric_view["joins"][0]["joins"][0]["name"] == "profiles"
     assert by_name(metric_view["measures"])["max_adjusted_score"]["expr"] == (
-        "MAX(users.profiles.base_score * users.multiplier)"
+        "MAX((users.profiles.base_score * users.multiplier))"
     )
 
 
