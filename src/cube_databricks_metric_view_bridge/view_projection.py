@@ -425,8 +425,75 @@ def _project_cubes(cubes, required, joins, needed_measures):
             # _measure_closure admits multi_stage only on a calculated measure with no
             # stage modifier; the Ossie converter would otherwise park it.
             measure.pop("multi_stage", None)
+        if isinstance(cube.get("sql"), str):
+            cube["sql"] = _inline_cube_sql(cube["sql"], cubes, (cube_name,))
         projected[cube_name] = cube
     return projected
+
+
+_CUBE_SQL_CALL_RE = re.compile(r"\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*sql\s*\(\s*\)\s*\}")
+# Cube's BaseQuery.cubeSql reads a cube whose SQL is a bare 'select * from <table>' as the table.
+_SELECT_STAR_FROM_RE = re.compile(r"^\s*select\s+\*\s+from\s+([a-zA-Z0-9_\-`\".*]+)\s*$", re.I)
+
+
+def _inline_cube_sql(sql, cubes, stack):
+    """Expand each ``{other_cube.sql()}`` in a cube's SQL as Cube does when it compiles a query.
+
+    A dataset source must be plain SQL. ``stack`` is the chain of cubes whose SQL is
+    being expanded, the cube that holds ``sql`` last.
+    """
+
+    whole = _CUBE_SQL_CALL_RE.fullmatch(sql.strip())
+    if whole:
+        return _referenced_cube_sql(whole.group(1), cubes, stack)[0]
+
+    def expand(match):
+        text, is_table = _referenced_cube_sql(match.group(1), cubes, stack)
+        if is_table:
+            return text
+        select_star = _SELECT_STAR_FROM_RE.match(text)
+        return select_star.group(1) if select_star else f"({text})"
+
+    return _CUBE_SQL_CALL_RE.sub(expand, sql)
+
+
+def _referenced_cube_sql(target, cubes, stack):
+    """A cube's table or expanded SQL, and whether it is a table."""
+
+    referrer = stack[-1]
+    reference = f"{{{target}.sql()}}"
+    if target in stack:
+        chain = " -> ".join((*stack, target))
+        raise ConversionError(f"cube '{referrer}' reads {reference} in a cycle: {chain}")
+    cube = cubes.get(target)
+    if cube is None:
+        raise ConversionError(
+            f"cube '{referrer}' reads {reference}, but cube '{target}' is not in the model"
+        )
+    target_source = cube.get("data_source", "default")
+    referrer_source = cubes[referrer].get("data_source", "default")
+    if target_source != referrer_source:
+        raise ConversionError(
+            f"cube '{referrer}' reads {reference} from data source '{target_source}', "
+            f"but its own data source is '{referrer_source}'"
+        )
+
+    table = cube.get("sql_table")
+    if table is not None:
+        text, is_table = str(table), True
+    elif isinstance(cube.get("sql"), str):
+        text = _inline_cube_sql(cube["sql"], cubes, (*stack, target))
+        is_table = False
+    else:
+        raise ConversionError(f"cube '{referrer}' reads {reference}, but '{target}' has no SQL")
+    # Cube resolves the rest of the referenced SQL ({CUBE}, members, context) as that
+    # cube; inlined into another cube's source, the same text would mean something else.
+    if leftover := _CUBE_REF_RE.search(text):
+        raise ConversionError(
+            f"cube '{referrer}' reads {reference}, whose SQL uses '{leftover.group(0)}', "
+            "which only Cube can resolve"
+        )
+    return text, is_table
 
 
 def _is_plain_column(name):
