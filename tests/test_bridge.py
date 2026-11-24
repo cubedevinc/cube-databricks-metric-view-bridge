@@ -1109,3 +1109,205 @@ def test_date_units_stay_units_in_dimensions_and_measures_reading_joined_cubes()
     assert {item["name"]: item["expr"] for item in metric_view["measures"]}["signup_hours"] == (
         "SUM(TIMESTAMPDIFF(HOUR, source.created_at, source.shipped_at))"
     )
+
+
+def test_join_path_member_reference_publishes_as_the_joined_member():
+    # Cube reads `{CUBE.users.tier}` as `users.tier` joined from `orders`.
+    model = (
+        _JOINED_DIMENSION_MODEL.replace(
+            "      - {name: count, type: count}\n",
+            "      - {name: count, type: count}\n"
+            "      - name: gold_users\n"
+            "        type: count_distinct\n"
+            "        sql: \"CASE WHEN {CUBE.users.tier} = 'gold' THEN {CUBE.users.id} END\"\n"
+            "      - name: gold_users_by_cube\n"
+            "        type: count_distinct\n"
+            "        sql: \"CASE WHEN {users.tier} = 'gold' THEN {users.id} END\"\n",
+        )
+        .replace(
+            "      - {name: status, sql: status, type: string}\n",
+            "      - {name: status, sql: status, type: string}\n"
+            '      - {name: path_country, sql: "{orders.users.countries.name}", type: string}\n',
+        )
+        .replace(
+            "includes: [status,", "includes: [gold_users, gold_users_by_cube, path_country, status,"
+        )
+    )
+
+    result = _convert(model)
+    measures = {
+        item["name"]: item["expr"] for item in yaml.safe_load(result.metric_view_yaml)["measures"]
+    }
+
+    assert (
+        measures["gold_users"] == "COUNT(DISTINCT CASE WHEN users.tier = 'gold' THEN users.id END)"
+    )
+    assert measures["gold_users"] == measures["gold_users_by_cube"]
+    assert _dimension_expressions(result)["path_country"] == "users.countries.name"
+
+
+def test_join_path_member_reference_off_the_published_joins_is_refused():
+    model = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+      - {name: countries, sql: "{CUBE}.ship_country_id = {countries}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: user_country, sql: "{CUBE.users.countries.name}", type: string}
+    measures:
+      - {name: count, type: count}
+  - name: users
+    sql_table: main.sales.users
+    joins:
+      - {name: countries, sql: "{CUBE}.country_id = {countries}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+  - name: countries
+    sql_table: main.sales.countries
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: name, sql: name, type: string}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [user_country, count]}
+      - {join_path: orders.users, includes: []}
+      - {join_path: orders.countries, includes: []}
+"""
+
+    with pytest.raises(ConversionError, match="through join path 'orders.users.countries'"):
+        _convert(model)
+
+
+def test_join_path_member_reference_follows_its_own_join_among_several():
+    # `users` is reachable directly and through `accounts`; Cube joins along the path named.
+    model = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+      - {name: accounts, sql: "{CUBE}.account_id = {accounts}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - {name: gold_users, type: count_distinct, sql: "CASE WHEN {CUBE.users.tier} = 'gold' THEN {CUBE}.user_id END"}
+  - name: accounts
+    sql_table: main.sales.accounts
+    joins:
+      - {name: users, sql: "{CUBE}.owner_id = {users}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: tier, sql: tier, type: string}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [gold_users]}
+"""
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+
+    assert set(_joins_by_name(metric_view)) == {"users"}
+    assert metric_view["measures"][0]["expr"] == (
+        "COUNT(DISTINCT CASE WHEN users.tier = 'gold' THEN source.user_id END)"
+    )
+    with pytest.raises(ConversionError, match="multiple declared join paths"):
+        _convert(model.replace("{CUBE.users.tier}", "{users.tier}"))
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ["{CUBE.users.tier_rank}", "{users.tier_rank}", "{order_max}", "{order_max_calc}"],
+)
+def test_aggregate_measure_reading_a_measure_is_refused(reference):
+    # SQL cannot nest one aggregate in another; Cube itself plans this as a subquery.
+    model = (
+        _JOINED_DIMENSION_MODEL.replace(
+            "      - {name: count, type: count}\n",
+            "      - {name: count, type: count}\n"
+            "      - {name: order_max, type: max, sql: id}\n"
+            '      - {name: order_max_calc, type: number, sql: "MAX({CUBE}.id) + 0"}\n'
+            "      - name: ranked_users\n"
+            "        type: count_distinct\n"
+            f'        sql: "CASE WHEN {reference} > 1 THEN {{users.id}} END"\n',
+        )
+        .replace(
+            '      - {name: country_name, sql: "{countries.name}", type: string}\n',
+            '      - {name: country_name, sql: "{countries.name}", type: string}\n'
+            "    measures:\n"
+            "      - {name: tier_rank, type: max, sql: rank}\n",
+        )
+        .replace("includes: [status,", "includes: [ranked_users, status,")
+    )
+
+    with pytest.raises(ConversionError, match="'orders.ranked_users' aggregates measure"):
+        _convert(model)
+
+
+def test_plain_reference_does_not_follow_a_path_another_member_named():
+    # Cube joins `{users.tier}` alone along the shortest path, orders -> users, so
+    # a plain reference stays ambiguous here whatever path another member names.
+    model = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+      - {name: accounts, sql: "{CUBE}.account_id = {accounts}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - name: owner_gold
+        type: count_distinct
+        sql: "CASE WHEN {CUBE.accounts.users.tier} = 'gold' THEN {CUBE}.id END"
+      - {name: buyer_gold, type: count_distinct, sql: "CASE WHEN {users.tier} = 'gold' THEN {CUBE}.id END"}
+  - name: accounts
+    sql_table: main.sales.accounts
+    joins:
+      - {name: users, sql: "{CUBE}.owner_id = {users}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: tier, sql: tier, type: string}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [owner_gold, buyer_gold]}
+"""
+
+    with pytest.raises(ConversionError, match="'users' through multiple declared join paths"):
+        _convert(model)
+    owner_only = yaml.safe_load(
+        _convert(model.replace("[owner_gold, buyer_gold]", "[owner_gold]")).metric_view_yaml
+    )
+    assert owner_only["measures"][0]["expr"] == (
+        "COUNT(DISTINCT CASE WHEN accounts.users.tier = 'gold' THEN source.id END)"
+    )
+
+
+def test_aggregate_over_a_row_level_calculated_measure_is_published():
+    # Cube renders a calculated measure's SQL as written, so this is SUM(price - discount).
+    model = _JOINED_DIMENSION_MODEL.replace(
+        "      - {name: count, type: count}\n",
+        "      - {name: count, type: count}\n"
+        '      - {name: net_price, type: number, sql: "{CUBE}.price - {CUBE}.discount"}\n'
+        '      - {name: net_revenue, type: sum, sql: "{net_price}"}\n',
+    ).replace("includes: [status,", "includes: [net_revenue, status,")
+
+    measures = {
+        item["name"]: item["expr"]
+        for item in yaml.safe_load(_convert(model).metric_view_yaml)["measures"]
+    }
+
+    assert measures["net_revenue"] == "SUM((source.price - source.discount))"

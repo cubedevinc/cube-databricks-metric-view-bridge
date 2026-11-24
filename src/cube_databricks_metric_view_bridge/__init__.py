@@ -13,7 +13,7 @@ from .bridge import (
 )
 from .view_projection import convert_cube_view_to_ossie
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "BridgeIssue",
