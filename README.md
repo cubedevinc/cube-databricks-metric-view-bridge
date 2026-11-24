@@ -53,6 +53,19 @@ are. A Metric View dimension must have one value per source row, so one that rea
 table behind a one-to-many join is rejected. `convert_cube_view_to_ossie` still
 rejects such a dimension, since an Ossie field reads only its own dataset.
 
+A reference through a join path from the member's own cube, such as
+`{CUBE.users.tier}` on `orders` or `{orders.users.countries.name}`, reads the last
+cube's member joined along that path, as Cube does, so it publishes as `users.tier`.
+The bridge joins that cube along the named path; a view whose own `join_path` entries
+reach it another way is rejected, since a Metric View joins each cube once. A plain
+reference such as `{users.tier}` names no path, so it still needs exactly one declared
+join path from the view root, or a view `join_path` entry that picks one.
+
+An aggregate measure such as `count_distinct` or `max` whose SQL or filters read a
+measure that aggregates is rejected: SQL cannot nest one aggregate in another.
+Reference a dimension instead. A calculated measure (`type: number`) can still combine
+measures, and an aggregate over a row-level calculated measure is published.
+
 A join whose condition is not a plain column equality, such as a range on effective
 dates (SCD2), an expression like `CAST(...)` or `date_trunc(...)`, or a comparison
 with a literal or keyword like `true` or `current_date`, is published with its Cube

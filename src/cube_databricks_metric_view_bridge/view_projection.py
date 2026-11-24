@@ -14,11 +14,13 @@ not accidentally publish private implementation members.
 
 import copy
 import dataclasses
+import functools
 import re
 from collections import deque
 
 from ossie_cube._common import (
     _CUBE_REF_RE,
+    CALCULATED_MEASURE_TYPES,
     OSSIE_VERSION,
     VENDOR,
     ConversionError,
@@ -105,6 +107,7 @@ def _convert_cube_view_to_ossie_with_provenance(
 
     collection_issues = IssueLog()
     cubes, _, views, _, _ = _collect(files, collection_issues)
+    cubes, path_references, plain_references = _inline_join_path_references(cubes)
     if view not in views:
         raise ConversionError(
             f"requested view '{view}' not found; views present: {sorted(views) or 'none'}"
@@ -130,6 +133,7 @@ def _convert_cube_view_to_ossie_with_provenance(
     dependency_cubes = {
         cube_name for cube_name, _ in needed_measures | needed_dimensions
     } | raw_dependency_cubes
+    needed_members = needed_measures | needed_dimensions
     required_cubes, joins = _expand_dependency_graph(
         view,
         cubes,
@@ -137,6 +141,8 @@ def _convert_cube_view_to_ossie_with_provenance(
         required_cubes,
         joins,
         dependency_cubes,
+        {path for member in needed_members for path in path_references.get(member, ())},
+        {cube for member in needed_members for cube in plain_references.get(member, ())},
     )
     resolved_source = _resolve_source(view, source, paths[0][0], required_cubes)
     projected_cubes = _project_cubes(cubes, required_cubes, joins, needed_measures)
@@ -473,16 +479,47 @@ def _with_carrier_joins(cube_name, cube, carriers):
     return {**cube, "joins": joins}
 
 
-def _expand_dependency_graph(view_name, cubes, root, required, joins, dependency_cubes):
-    """Add uniquely reachable cubes needed by hidden member dependencies."""
+def _expand_dependency_graph(
+    view_name, cubes, root, required, joins, dependency_cubes, member_paths, plain_reads
+):
+    """Add the cubes that hidden member dependencies need.
+
+    A join-path reference such as `{CUBE.users.name}` names the path Cube joins
+    along, which is followed from its first cube. A cube read without a path
+    (`plain_reads`) must be reachable from the root along one declared path, even
+    when a join-path reference already placed it: Cube joins a plain reference
+    along the shortest path, not along another member's.
+    """
 
     expanded_required = list(required)
     expanded_joins = {cube_name: dict(targets) for cube_name, targets in joins.items()}
     parent_of = {
         target: cube_name for cube_name, targets in expanded_joins.items() for target in targets
     }
+
+    def follows(path):
+        return all(
+            right != root and parent_of.get(right, left) == left
+            for left, right in zip(path, path[1:], strict=False)
+        )
+
+    pending = set(member_paths)
+    while ready := sorted(path for path in pending if path[0] in expanded_required):
+        pending.difference_update(ready)
+        for path in ready:
+            if not follows(path):
+                continue
+            for left, right in zip(path, path[1:], strict=False):
+                parent_of[right] = left
+                expanded_joins.setdefault(left, {})[right] = _find_join(cubes[left], left, right)
+                if right not in expanded_required:
+                    expanded_required.append(right)
+
+    placed_by_paths = set(expanded_required) - set(required)
     for target in sorted(dependency_cubes):
-        if target in expanded_required:
+        if target in expanded_required and not (
+            target in placed_by_paths and target in plain_reads
+        ):
             continue
         paths = _declared_join_paths(cubes, root, target)
         if not paths:
@@ -505,6 +542,17 @@ def _expand_dependency_graph(view_name, cubes, root, required, joins, dependency
             expanded_joins.setdefault(left, {})[right] = _find_join(cubes[left], left, right)
             if right not in expanded_required:
                 expanded_required.append(right)
+
+    for path in sorted(member_paths):
+        if any(
+            right not in expanded_joins.get(left, {})
+            for left, right in zip(path, path[1:], strict=False)
+        ):
+            raise ConversionError(
+                f"view '{view_name}': selected members read cube '{path[-1]}' through join "
+                f"path '{'.'.join(path)}', which the view's joins do not follow; a Metric "
+                "View joins each cube along one path"
+            )
     return expanded_required, expanded_joins
 
 
@@ -720,6 +768,93 @@ def _dimension_expression_texts(dimension):
         label = holder.get("label")
         if isinstance(label, dict) and isinstance(label.get("sql"), str):
             yield label["sql"]
+
+
+def _inline_join_path_references(cubes):
+    """Rewrite `{CUBE.users.name}` as `{users.name}`, keeping the join path it names.
+
+    Cube reads a member reference through a chain of joined cubes as that cube's
+    member, joined along the chain. The bridge joins each cube along one path, so
+    each member's chains are kept to follow, and the other cubes it reads without
+    a path are kept to resolve as before.
+    """
+
+    paths = {}
+    plain = {}
+    result = {}
+    for cube_name, cube in cubes.items():
+        result[cube_name] = cube
+        for collection in ("dimensions", "measures"):
+            members = _as_named_list(cube.get(collection), f"cube '{cube_name}' {collection}")
+            rewritten = []
+            for member in members:
+                key = (cube_name, member.get("name"))
+                paths[key], plain[key] = [], set()
+                rewrite = functools.partial(
+                    _inline_paths,
+                    own_cube=cube_name,
+                    cubes=cubes,
+                    paths=paths[key],
+                    plain=plain[key],
+                )
+                rewritten.append(_rewrite_sql_values(member, rewrite))
+            if rewritten != members:
+                result[cube_name] = {**result[cube_name], collection: rewritten}
+    return result, paths, plain
+
+
+def _rewrite_sql_values(value, rewrite):
+    if isinstance(value, list):
+        return [_rewrite_sql_values(item, rewrite) for item in value]
+    if not isinstance(value, dict):
+        return value
+    rewritten = {}
+    for key, item in value.items():
+        if key == "sql" and isinstance(item, str):
+            rewritten[key] = rewrite(item)
+        elif key == "meta":
+            rewritten[key] = item
+        else:
+            rewritten[key] = _rewrite_sql_values(item, rewrite)
+    return rewritten
+
+
+def _inline_paths(text, *, own_cube, cubes, paths, plain):
+    def replace(match):
+        if match.start() and text[match.start() - 1] == "\\":
+            return match.group(0)
+        parts = [part.strip() for part in match.group(1).split(".")]
+        head = own_cube if parts[0] in ("CUBE", "TABLE") else parts[0]
+        path = [head]
+        # Only a path from the member's own cube is followed. Cube reads a member of
+        # the current cube before a joined cube of that name.
+        for segment in parts[1:-1] if head == own_cube else ():
+            if (
+                segment not in cubes
+                or segment in path
+                or _cube_has_member(cubes[path[-1]], path[-1], segment)
+            ):
+                break
+            path.append(segment)
+        if len(path) < 2 or len(path) != len(parts) - 1:
+            if head != own_cube and head in cubes:
+                plain.add(head)
+            return match.group(0)
+        paths.append(tuple(path))
+        return (
+            text[match.start() : match.start(1)]
+            + f"{path[-1]}.{parts[-1]}"
+            + text[match.end(1) : match.end()]
+        )
+
+    return _CUBE_REF_RE.sub(replace, text)
+
+
+def _has_aggregate(sql):
+    try:
+        return parse_one(sql, read="databricks").find(exp.AggFunc) is not None
+    except SqlglotError:
+        return True
 
 
 def _cube_references(text, own_cube, cubes):
@@ -1179,6 +1314,21 @@ class _PublicationMeasureResolver(_MeasureResolver):
                 )
             if target is not None and self._dimensions.has_dimension(*target):
                 return self._dimensions.expression(*target, qualified=True)
+            if (
+                target is not None
+                and stack
+                and self.is_measure(*target)
+                and self.aggregate_of(*stack[-1]) not in CALCULATED_MEASURE_TYPES
+                and _has_aggregate(
+                    super(_PublicationMeasureResolver, self)._resolve(body, cname, stack, True)
+                )
+            ):
+                # SQL cannot nest aggregates; Cube plans this as a subquery instead.
+                raise ConversionError(
+                    f"measure '{stack[-1][0]}.{stack[-1][1]}' aggregates measure "
+                    f"'{target[0]}.{target[1]}'; an aggregate of an aggregate has no "
+                    "Metric View form, so reference a dimension instead"
+                )
             return super(_PublicationMeasureResolver, self)._resolve(
                 body,
                 cname,
