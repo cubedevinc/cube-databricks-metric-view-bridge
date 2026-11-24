@@ -549,7 +549,7 @@ def test_unparseable_joined_expression_is_not_silently_claimed_as_fixed():
         _convert(model)
 
 
-def test_metric_with_nested_sql_bindings_returns_no_publishable_artifact():
+def test_metric_with_a_lambda_returns_no_publishable_artifact():
     model = """
 cubes:
   - name: orders
@@ -558,7 +558,7 @@ cubes:
       - {name: id, sql: id, type: number, primary_key: true}
     measures:
       - name: unsafe_metric
-        sql: "(SELECT max(value) FROM items)"
+        sql: "aggregate(items, 0, (acc, x) -> acc + x)"
         type: max
 views:
   - name: sales
@@ -568,6 +568,111 @@ views:
 
     with pytest.raises(ConversionError, match="nested SQL bindings"):
         _convert(model)
+
+
+_SUBQUERY_MODEL = """
+cubes:
+  - name: usage
+    sql: >
+      SELECT metric_ts, metric_type, metric_value, account_id, bot_id
+      FROM main.product.usage_metrics
+    joins:
+      - name: accounts
+        sql: "{CUBE}.account_id = {accounts}.id"
+        relationship: many_to_one
+    dimensions:
+      - {name: metric_ts, sql: "{CUBE}.metric_ts", type: time, primary_key: true}
+      - {name: account_id, sql: "{CUBE}.account_id", type: string, primary_key: true}
+      - {name: bot_id, sql: "coalesce({CUBE}.bot_id, '')", type: string}
+    measures:
+      - name: licensed_usage
+        type: sum
+        sql: >
+          case when {CUBE}.metric_type = 'usage' and {CUBE}.account_id IN (
+            SELECT account_id FROM main.product.usage_metrics
+            WHERE metric_ts = {CUBE}.metric_ts -- the same month
+              AND coalesce(properties.is_trial, 0) <> 1
+          ) then {CUBE}.metric_value else 0 end
+      - name: busy_accounts
+        type: count_distinct
+        sql: >
+          case when {CUBE}.account_id IN (
+            SELECT p.account_id FROM (
+              SELECT u.account_id, SUM(u.metric_value) AS total
+              FROM main.product.usage_metrics u
+              WHERE u.metric_ts = {CUBE}.metric_ts AND u.properties['bot_id'] = {bot_id}
+              GROUP BY u.account_id
+            ) p
+            WHERE p.total > 5
+          ) then {CUBE}.account_id end
+      - name: usage_per_busy_account
+        type: number
+        sql: "{licensed_usage} / nullif({busy_accounts}, 0)"
+  - name: accounts
+    sql_table: main.product.accounts
+    dimensions:
+      - {name: id, sql: id, type: string, primary_key: true}
+      - {name: region, sql: region, type: string}
+views:
+  - name: adoption
+    cubes:
+      - join_path: usage
+        includes: [metric_ts, licensed_usage, busy_accounts, usage_per_busy_account]
+      - {join_path: usage.accounts, includes: [region]}
+"""
+
+_LICENSED_USAGE = (
+    "SUM(case when source.metric_type = 'usage' and source.account_id IN (\n"
+    "  SELECT account_id FROM main.product.usage_metrics\n"
+    "  WHERE metric_ts = __cube_outer_0__ -- the same month\n"
+    "    AND coalesce(properties.is_trial, 0) <> 1\n"
+    ") then source.metric_value else 0 end)"
+)
+_BUSY_ACCOUNTS = (
+    "COUNT(DISTINCT case when source.account_id IN (\n"
+    "  SELECT p.account_id FROM (\n"
+    "    SELECT u.account_id, SUM(u.metric_value) AS total\n"
+    "    FROM main.product.usage_metrics u\n"
+    "    WHERE u.metric_ts = __cube_outer_0__ AND u.properties['bot_id'] = coalesce(__cube_outer_1__, '')\n"
+    "    GROUP BY u.account_id\n"
+    "  ) p\n"
+    "  WHERE p.total > 5\n"
+    ") then source.account_id end)"
+)
+
+
+def test_metric_subquery_reads_the_outer_row_through_uniquely_named_source_columns():
+    result = convert_cube_view_to_databricks_metric_view(
+        {"model/usage.yml": _SUBQUERY_MODEL}, "adoption"
+    )
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expressions = {item["name"]: item["expr"] for item in metric_view["measures"]}
+
+    assert metric_view["source"] == (
+        "SELECT *, metric_ts AS __cube_outer_0__, bot_id AS __cube_outer_1__ FROM "
+        "(SELECT metric_ts, metric_type, metric_value, account_id, bot_id "
+        "FROM main.product.usage_metrics) AS __cube_outer_source__"
+    )
+
+    assert expressions == {
+        "licensed_usage": _LICENSED_USAGE,
+        "busy_accounts": _BUSY_ACCOUNTS,
+        "usage_per_busy_account": f"{_LICENSED_USAGE} / nullif({_BUSY_ACCOUNTS}, 0)",
+    }
+    assert [item["name"] for item in metric_view["dimensions"]] == ["metric_ts", "region"]
+
+
+@pytest.mark.parametrize("reference", ["{accounts.region}", "{accounts}.region"])
+def test_metric_subquery_reading_a_joined_cube_fails_closed(reference):
+    model = _SUBQUERY_MODEL.replace(
+        "WHERE metric_ts = {CUBE}.metric_ts",
+        f"WHERE metric_ts = {{CUBE}}.metric_ts AND region = {reference}",
+    )
+
+    with pytest.raises(ConversionError, match="reads join 'accounts' inside a subquery"):
+        convert_cube_view_to_databricks_metric_view(
+            {"model/usage.yml": model}, "adoption", strict_fanout=False
+        )
 
 
 def test_conversion_is_deterministic_and_result_is_immutable():
@@ -1311,3 +1416,127 @@ def test_aggregate_over_a_row_level_calculated_measure_is_published():
     }
 
     assert measures["net_revenue"] == "SUM((source.price - source.discount))"
+
+
+@pytest.mark.parametrize(
+    "subquery",
+    [
+        "(SELECT account_id FROM main.product.trials) UNION SELECT account_id "
+        "FROM main.product.usage_metrics WHERE metric_ts = {CUBE}.metric_ts",
+        "((SELECT account_id FROM main.product.trials)) except all SELECT account_id "
+        "FROM main.product.usage_metrics WHERE metric_ts = {CUBE}.metric_ts",
+        "FROM main.product.usage_metrics SELECT account_id WHERE metric_ts = {CUBE}.metric_ts",
+    ],
+)
+def test_metric_subquery_columns_stay_unqualified_in_every_query_form(subquery):
+    model = f"""
+cubes:
+  - name: usage
+    sql_table: main.product.usage_metrics
+    dimensions:
+      - {{name: account_id, sql: account_id, type: string, primary_key: true}}
+    measures:
+      - name: licensed_usage
+        type: sum
+        sql: "case when account_id IN ({subquery}) then metric_value end"
+views:
+  - name: adoption
+    cubes:
+      - {{join_path: usage, includes: [licensed_usage]}}
+"""
+    result = convert_cube_view_to_databricks_metric_view({"model/usage.yml": model}, "adoption")
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    expected = subquery.replace("{CUBE}.metric_ts", "__cube_outer_0__")
+
+    assert metric_view["source"] == (
+        "SELECT *, metric_ts AS __cube_outer_0__ FROM main.product.usage_metrics"
+    )
+    assert metric_view["measures"][0]["expr"] == (
+        f"SUM(case when source.account_id IN ({expected}) then source.metric_value end)"
+    )
+
+
+def test_aggregate_inside_a_subquery_does_not_make_a_referenced_measure_aggregating():
+    model = """
+cubes:
+  - name: usage
+    sql_table: main.product.usage_metrics
+    dimensions:
+      - {name: account_id, sql: account_id, type: string, primary_key: true}
+    measures:
+      - name: busy_value
+        type: number
+        sql: >
+          case when {CUBE}.account_id IN (
+            SELECT account_id FROM main.product.usage_metrics GROUP BY account_id
+            HAVING SUM(metric_value) > 5
+          ) then {CUBE}.metric_value else 0 end
+      - {name: busy_total, type: sum, sql: "{busy_value}"}
+views:
+  - name: adoption
+    cubes:
+      - {join_path: usage, includes: [busy_total]}
+"""
+    result = convert_cube_view_to_databricks_metric_view({"model/usage.yml": model}, "adoption")
+
+    assert yaml.safe_load(result.metric_view_yaml)["measures"][0]["expr"] == (
+        "SUM((case when source.account_id IN (\n"
+        "  SELECT account_id FROM main.product.usage_metrics GROUP BY account_id\n"
+        "  HAVING SUM(metric_value) > 5\n"
+        ") then source.metric_value else 0 end\n))"
+    )
+
+
+_DIMENSION_IN_SUBQUERY_MODEL = """
+cubes:
+  - name: usage
+    sql_table: main.product.usage_metrics
+    dimensions:
+      - {name: account_id, sql: account_id, type: string, primary_key: true}
+      - {name: bot_key, sql: "%s", type: string}
+      - {name: bot_label, sql: "{bot_key}", type: string}
+    measures:
+      - {name: total, type: sum, sql: metric_value}
+      - name: bot_usage
+        type: sum
+        sql: >
+          case when {CUBE}.account_id IN (
+            SELECT u.account_id FROM main.product.usage_metrics u WHERE u.bot = %s
+          ) then {CUBE}.metric_value end
+views:
+  - name: adoption
+    cubes:
+      - {join_path: usage, includes: [bot_usage]}
+"""
+
+
+@pytest.mark.parametrize("reference", ["{bot_key}", "{bot_label}"])
+def test_dimension_with_bare_columns_inside_a_measure_subquery_fails_closed(reference):
+    # Cube pastes the dimension's SQL into the subquery, where `bot_id` binds to `u`.
+    model = _DIMENSION_IN_SUBQUERY_MODEL % ("coalesce(bot_id, '')", reference)
+
+    with pytest.raises(ConversionError, match="bare column"):
+        convert_cube_view_to_databricks_metric_view({"model/usage.yml": model}, "adoption")
+
+
+def test_single_identifier_dimension_inside_a_measure_subquery_reads_the_outer_row():
+    # Cube prefixes a dimension whose SQL is one identifier with the cube's alias.
+    model = _DIMENSION_IN_SUBQUERY_MODEL % ("bot_id", "{bot_label}")
+    result = convert_cube_view_to_databricks_metric_view({"model/usage.yml": model}, "adoption")
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+
+    assert metric_view["source"] == (
+        "SELECT *, bot_id AS __cube_outer_0__ FROM main.product.usage_metrics"
+    )
+    assert "WHERE u.bot = __cube_outer_0__" in metric_view["measures"][0]["expr"]
+
+
+@pytest.mark.parametrize(
+    "reference, error",
+    [("hash({CUBE}.*)", "cannot be safely rendered"), ("{total}", "reads measure")],
+)
+def test_star_or_measure_reference_inside_a_measure_subquery_fails_closed(reference, error):
+    model = _DIMENSION_IN_SUBQUERY_MODEL % ("bot_id", reference)
+
+    with pytest.raises(ConversionError, match=error):
+        convert_cube_view_to_databricks_metric_view({"model/usage.yml": model}, "adoption")
