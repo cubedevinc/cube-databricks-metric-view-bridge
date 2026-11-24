@@ -90,6 +90,17 @@ intermediate Ossie artifact of
 on a carrier column, since an Ossie relationship holds only column equalities;
 `convert_cube_view_to_ossie` leaves the join out, as the Cube converter does.
 
+A Metric View's rows are its source's rows. When every join in a view's projection is
+`many_to_one` or `one_to_one`, no source row repeats, so a measure of the source cube
+aggregates each row once, as Cube does, whatever joined columns it reads. A `sum` of
+`CASE WHEN {customers.tier} = 'gold' THEN {CUBE}.amount END` on `orders` publishes as
+`SUM(CASE WHEN customers.tier = 'gold' THEN source.amount END)`, across an equality,
+range or expression join. The Cube converter reports such a measure as fan-out unsafe,
+since it judges the model without a source, and `convert_cube_view_to_ossie` keeps that
+verdict. A measure of a joined cube repeats once per source row and is still refused, as
+is a measure that references another cube's measure, any measure of a projection with a
+`one_to_many` join, and any measure when `source` selects a dataset other than the root.
+
 A cube `sql` or `sql_table` that reads another cube's SQL through
 `{other_cube.sql()}` is expanded the way Cube compiles it, so the dataset source is
 plain SQL: the referenced cube's `sql_table` as written, or its `sql` in parentheses

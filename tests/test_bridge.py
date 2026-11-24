@@ -19,6 +19,7 @@ from cube_databricks_metric_view_bridge import (
     ConversionResult,
     DatasetSourceResolution,
     convert_cube_view_to_databricks_metric_view,
+    convert_cube_view_to_ossie,
 )
 from cube_databricks_metric_view_bridge.bridge import _dataset_qualifiers, _qualify_table_source
 
@@ -907,6 +908,147 @@ def test_condition_join_keeps_fanout_checks():
         _convert(model)
     relaxed = _convert(model, strict_fanout=False)
     assert any(item.code == "FANOUT_UNSAFE_METRIC" for item in relaxed.issues)
+
+
+_SOURCE_GRAIN_MODEL = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - name: customers
+        relationship: many_to_one
+        sql: "CUSTOMERS_JOIN"
+      - name: line_items
+        relationship: one_to_many
+        sql: "{CUBE}.id = {line_items}.order_id"
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: status, sql: status, type: string}
+    measures:
+      - {name: revenue, sql: amount, type: sum}
+      - name: gold_revenue
+        sql: "CASE WHEN {customers.tier} = 'gold' THEN {CUBE}.amount END"
+        type: sum
+      - name: gold_revenue_path
+        sql: "CASE WHEN {CUBE.customers.tier} = 'gold' THEN {CUBE}.amount END"
+        type: sum
+      - name: emea_average
+        sql: "CASE WHEN {CUBE.customers.regions.name} = 'EMEA' THEN {CUBE}.amount END"
+        type: avg
+      - {name: gold_share, sql: "{gold_revenue} / NULLIF({revenue}, 0)", type: number}
+      - name: revenue_per_credit
+        sql: "{revenue} / NULLIF({customers.credit_limit}, 0)"
+        type: number
+      - name: multi_item_revenue
+        sql: "CASE WHEN {line_items}.qty > 1 THEN {CUBE}.amount END"
+        type: sum
+  - name: customers
+    sql_table: main.sales.customers
+    joins:
+      - name: regions
+        relationship: many_to_one
+        sql: "{CUBE}.region_id = {regions}.id"
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: tier, sql: tier, type: string}
+    measures:
+      - {name: credit_limit, sql: credit_limit, type: sum}
+  - name: regions
+    sql_table: main.sales.regions
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: name, sql: name, type: string}
+  - name: line_items
+    sql_table: main.sales.line_items
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: ORDERS_INCLUDES}
+      - {join_path: orders.customers, includes: CUSTOMERS_INCLUDES}
+"""
+
+_CUSTOMERS_JOINS = {
+    "equality": "{CUBE}.customer_id = {customers}.id",
+    "range": "{CUBE}.customer_id = {customers}.id AND {CUBE}.ordered_at >= {customers}.valid_from"
+    " AND {CUBE}.ordered_at < {customers}.valid_to",
+    "expression": "CAST({CUBE}.customer_id AS INT) = {customers}.id",
+}
+
+
+def _source_grain_model(orders, customers="[tier]", join="equality"):
+    return (
+        _SOURCE_GRAIN_MODEL.replace("CUSTOMERS_JOIN", _CUSTOMERS_JOINS[join])
+        .replace("ORDERS_INCLUDES", orders)
+        .replace("CUSTOMERS_INCLUDES", customers)
+    )
+
+
+def _fanout_elements(result):
+    return {item.element for item in result.issues if item.code == "FANOUT_UNSAFE_METRIC"}
+
+
+@pytest.mark.parametrize("join", sorted(_CUSTOMERS_JOINS))
+def test_source_measure_reading_many_to_one_cubes_publishes(join):
+    # A Metric View row is a source row, and a to-one join cannot repeat it, so these sum
+    # each order once, as Cube does.
+    model = _source_grain_model(
+        "[status, gold_revenue, gold_revenue_path, emea_average, gold_share]", join=join
+    )
+
+    result = _convert(model)
+    measures = {
+        item["name"]: item["expr"]
+        for item in yaml.safe_load(result.metric_view_yaml)["measures"]
+    }
+
+    assert not _fanout_elements(result)
+    gold = "SUM(CASE WHEN customers.tier = 'gold' THEN source.amount END)"
+    assert measures == {
+        "gold_revenue": gold,
+        "gold_revenue_path": gold,
+        "emea_average": "AVG(CASE WHEN customers.regions.name = 'EMEA' THEN source.amount END)",
+        "gold_share": f"{gold} / NULLIF(SUM(source.amount), 0)",
+    }
+    # The Ossie artifact has no source, so it keeps the converter's model-wide verdict.
+    with pytest.raises(ConversionError, match="FANOUT_UNSAFE_METRIC"):
+        convert_cube_view_to_ossie({"model/views/sales.yml": model}, "sales")
+
+
+@pytest.mark.parametrize(
+    ("orders", "customers", "refused"),
+    [
+        # A joined cube's measure repeats once per order.
+        ("[status]", "[tier, credit_limit]", {"customers.credit_limit"}),
+        (
+            "[status, revenue_per_credit]",
+            "[tier]",
+            {"orders.revenue_per_credit", "customers.credit_limit"},
+        ),
+        # Any one-to-many join can repeat a source row.
+        (
+            "[status, gold_revenue, multi_item_revenue]",
+            "[tier]",
+            {"orders.gold_revenue", "orders.multi_item_revenue"},
+        ),
+    ],
+)
+def test_measure_that_can_repeat_rows_keeps_the_fanout_refusal(orders, customers, refused):
+    model = _source_grain_model(orders, customers)
+
+    with pytest.raises(ConversionError, match="FANOUT_UNSAFE_METRIC"):
+        _convert(model)
+    assert _fanout_elements(_convert(model, strict_fanout=False)) == refused
+
+
+def test_source_override_keeps_the_fanout_refusal():
+    model = _source_grain_model("[]", "[tier, credit_limit]")
+
+    result = _convert(model, source="customers", strict_fanout=False)
+
+    assert result.source == "customers"
+    assert _fanout_elements(result) == {"customers.credit_limit"}
 
 
 def test_source_override_reorients_a_condition_join():
