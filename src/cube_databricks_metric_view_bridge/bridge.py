@@ -589,6 +589,11 @@ def _apply_expression_templates(
                 f"dataset '{dataset}' has no emitted Metric View join path from source '{source}'"
             )
 
+    corpus = "\n".join([metric_view_yaml, *templates["measures"].values()]).casefold()
+    outer_prefix = "__cube_outer_"
+    while outer_prefix in corpus:
+        outer_prefix = "_" + outer_prefix
+    outer_columns = {}
     one_to_many = _one_to_many_join_paths(metric_view.get("joins"))
     for collection, kind in (("measures", "metric"), ("dimensions", "dimension")):
         items = {
@@ -614,7 +619,15 @@ def _apply_expression_templates(
                             "one-to-many; a Metric View dimension must have one value per "
                             "source row"
                         )
-            item["expr"] = _render_metric_template(template, marker_paths, f"{kind} '{name}'")
+            item["expr"] = _render_metric_template(
+                template, marker_paths, f"{kind} '{name}'", outer_columns, outer_prefix
+            )
+    if outer_columns:
+        columns = ", ".join(f"{column} AS {name}" for column, name in outer_columns.items())
+        source_sql = str(metric_view["source"]).strip()
+        if re.match(r"(?i)(select|with)\b", source_sql):
+            source_sql = f"({source_sql}) AS {outer_prefix}source__"
+        metric_view["source"] = f"SELECT *, {columns} FROM {source_sql}"
     return dump_databricks_yaml(metric_view)
 
 
@@ -633,17 +646,17 @@ def _one_to_many_join_paths(joins, parent=(), under_one_to_many=False):
     return paths
 
 
-def _render_metric_template(expression, marker_paths, scope):
-    """Replace only provenance markers while preserving the original SQL text."""
+def _render_metric_template(expression, marker_paths, scope, outer_columns=None, outer_prefix=""):
+    """Replace only provenance markers while preserving the original SQL text.
+
+    ``outer_columns`` collects {source column SQL: unique name} for the source columns
+    a subquery reads from the outer row; without it such a read is refused.
+    """
 
     try:
         tokens = Dialect.get_or_raise("databricks").tokenize(expression)
         tree = parse_one(expression, read="databricks")
-        if (
-            tree is None
-            or tree.find(exp.Query) is not None
-            or any(token.token_type is TokenType.ARROW for token in tokens)
-        ):
+        if tree is None or any(token.token_type is TokenType.ARROW for token in tokens):
             raise ConversionError(
                 f"{scope} contains nested SQL bindings whose dataset "
                 "provenance cannot be safely rendered"
@@ -651,6 +664,37 @@ def _render_metric_template(expression, marker_paths, scope):
         edits = []
         for column in tree.find_all(exp.Column):
             target, parts = _complete_column_path(column)
+            if column.find_ancestor(exp.Query) is not None:
+                # A subquery's own columns bind to its FROM; only Cube references in
+                # it carry a dataset marker.
+                path = marker_paths.get(parts[0].name.casefold()) if len(parts) > 1 else None
+                if path is None:
+                    if any(
+                        isinstance(part, exp.Identifier) and part.name.casefold() in marker_paths
+                        for part in column.parts
+                    ):
+                        raise ConversionError(
+                            f"{scope} contains a column path that cannot be safely rendered"
+                        )
+                    continue
+                if path != ("source",) or outer_columns is None:
+                    raise ConversionError(
+                        f"{scope} reads join '{'.'.join(path)}' inside a subquery; a "
+                        "Metric View subquery can read only the source row"
+                    )
+                # Databricks does not resolve `source.col` inside a subquery, and a bare
+                # `col` would bind to the subquery's own table, so the outer column is
+                # exposed on the source under a unique name.
+                start, end = parts[1].meta.get("start"), parts[-1].meta.get("end")
+                if not isinstance(start, int) or not isinstance(end, int):
+                    raise ConversionError(
+                        f"{scope} contains a column whose source position cannot be determined"
+                    )
+                name = outer_columns.setdefault(
+                    expression[start : end + 1], f"{outer_prefix}{len(outer_columns)}__"
+                )
+                edits.append((parts[0].meta["start"], end + 1, name))
+                continue
             if target is None or len(parts) < 2:
                 raise ConversionError(
                     f"{scope} contains a column path that cannot be safely rendered"

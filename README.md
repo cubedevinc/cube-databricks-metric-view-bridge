@@ -33,8 +33,18 @@ measure of `type: number` with no `group_by`, `reduce_by`, `add_group_by`,
 `time_shift` or `grain`: Cube computes it from the measures it references at the
 query's grain, so it publishes as the same calculated measure without `multi_stage`
 would. Metric expressions must be statically
-parseable without nested query or lambda binding scopes so the bridge can prove the
-source dataset of every physical column. Joined-dataset references retain their
+parseable without lambda binding scopes so the bridge can prove the source dataset
+of every physical column. A measure may contain a subquery, such as a correlated
+`{CUBE}.id IN (SELECT id FROM t WHERE t.ts = {CUBE}.ts)`. The subquery's own
+columns are published as written, so they bind to its own `FROM` as in Cube.
+Databricks does not resolve `source.col` inside a subquery, and a bare `col` there
+would bind to the subquery's own table, so each source column a subquery reads
+from the outer row is added to the Metric View `source` under a unique name
+(`SELECT *, ts AS __cube_outer_0__ FROM ...`) and referenced by that name. A
+subquery that reads a joined cube or a measure is rejected, and so is one that reads
+a dimension whose SQL has a bare column: Cube pastes that SQL into the subquery,
+where the column binds to the subquery's own table. Dimension and join SQL still
+reject subqueries. Joined-dataset references retain their
 Cube reference provenance; a physical multipart column is never inferred to be a
 join merely because its first component matches a cube name.
 Source-owned fields and metric columns use Databricks' explicit `source` qualifier,

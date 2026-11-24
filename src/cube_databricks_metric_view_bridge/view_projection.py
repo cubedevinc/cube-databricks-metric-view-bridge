@@ -48,7 +48,7 @@ from ossie_cube.cube_to_osi import (
     convert_cube_to_ossie,
     parked_of,
 )
-from ossie_cube.expressions import has_top_level_operator
+from ossie_cube.expressions import _REF_SENTINEL, _mask_references, has_top_level_operator
 from sqlglot import Dialect, exp, parse_one
 from sqlglot.errors import SqlglotError
 from sqlglot.tokens import TokenType
@@ -750,6 +750,48 @@ def _measure_expression_texts(measure):
     return (text for text in texts if isinstance(text, str))
 
 
+def _parse_masked(sql):
+    """Cube SQL parsed with each `{...}` reference as a sentinel column, and {sentinel: body}."""
+
+    masked, references = _mask_references(str(sql))
+    sentinels = {
+        _REF_SENTINEL.format(index): reference[1:-1].strip()
+        for index, reference in enumerate(references)
+    }
+    return parse_one(masked, read="databricks"), sentinels
+
+
+def _has_bare_column(sql):
+    """Whether Cube pastes ``sql`` with a column that binds to whatever scope it lands in.
+
+    Cube prefixes only SQL that is a single identifier with the cube's alias.
+    """
+
+    if re.fullmatch(r"\s*[_a-zA-Z][_a-zA-Z0-9]*\s*", str(sql)):
+        return False
+    try:
+        tree, sentinels = _parse_masked(sql)
+    except SqlglotError:
+        return True
+    return any(
+        not column.table and column.name not in sentinels for column in tree.find_all(exp.Column)
+    )
+
+
+def _references_inside_subqueries(sql):
+    """The `{...}` reference bodies that Cube SQL places inside a subquery."""
+
+    try:
+        tree, sentinels = _parse_masked(sql)
+    except SqlglotError:
+        return []
+    return [
+        sentinels[column.name]
+        for column in tree.find_all(exp.Column)
+        if column.name in sentinels and column.find_ancestor(exp.Query) is not None
+    ]
+
+
 def _dimension_expression_texts(dimension):
     sql = dimension.get("sql")
     if isinstance(sql, str):
@@ -851,10 +893,13 @@ def _inline_paths(text, *, own_cube, cubes, paths, plain):
 
 
 def _has_aggregate(sql):
+    """Whether ``sql`` aggregates its own rows; an aggregate inside a subquery does not."""
+
     try:
-        return parse_one(sql, read="databricks").find(exp.AggFunc) is not None
+        tree = parse_one(sql, read="databricks")
     except SqlglotError:
         return True
+    return any(node.find_ancestor(exp.Query) is None for node in tree.find_all(exp.AggFunc))
 
 
 def _cube_references(text, own_cube, cubes):
@@ -936,11 +981,15 @@ def _replace_raw_dataset_aliases(sql, own_cube, markers, *, reject_cross, scope)
     return _CUBE_REF_RE.sub(replace, text)
 
 
-def _qualify_physical_columns(expression, qualifier, known_qualifiers, scope, bare_only=False):
+def _qualify_physical_columns(
+    expression, qualifier, known_qualifiers, scope, bare_only=False, subqueries=False
+):
     """Attach provenance without reserializing or otherwise changing user SQL.
 
     With ``bare_only``, a multipart column outside ``known_qualifiers`` is refused
-    rather than read as a struct path of ``qualifier``.
+    rather than read as a struct path of ``qualifier``. With ``subqueries``, a
+    subquery is allowed and its columns are left as written: they bind to its own
+    FROM, and its Cube references already carry a dataset marker.
     """
 
     try:
@@ -948,7 +997,7 @@ def _qualify_physical_columns(expression, qualifier, known_qualifiers, scope, ba
         tree = parse_one(expression, read="databricks")
         if (
             tree is None
-            or tree.find(exp.Query) is not None
+            or (not subqueries and tree.find(exp.Query) is not None)
             or any(token.token_type is TokenType.ARROW for token in tokens)
         ):
             raise ConversionError(
@@ -957,6 +1006,8 @@ def _qualify_physical_columns(expression, qualifier, known_qualifiers, scope, ba
             )
         edits = []
         for column in tree.find_all(exp.Column):
+            if subqueries and column.find_ancestor(exp.Query) is not None:
+                continue
             _, parts = _complete_column_path(column)
             if not parts:
                 raise ConversionError(
@@ -1057,6 +1108,24 @@ class _DimensionResolver:
 
     def has_dimension(self, cube_name, member_name):
         return (cube_name, member_name) in self._dimensions
+
+    def has_bare_column(self, cube_name, member_name, stack=()):
+        """Whether a dimension's SQL, or a dimension it reads, has a bare column."""
+
+        marker = (cube_name, member_name)
+        if marker in stack:
+            return False
+        for text in _dimension_expression_texts(self._dimensions[marker]):
+            if _has_bare_column(text):
+                return True
+            for kind, target in _cube_references(text, cube_name, self._cubes):
+                if (
+                    kind == "member"
+                    and target in self._dimensions
+                    and self.has_bare_column(*target, stack + (marker,))
+                ):
+                    return True
+        return False
 
     def reads_other_cube(self, cube_name, member_name, stack=()):
         """Whether a dimension reads another cube, directly or through its own dimensions."""
@@ -1303,15 +1372,34 @@ class _PublicationMeasureResolver(_MeasureResolver):
             scope=f"{cname}.{stack[0][1] if stack else '<unknown>'}",
         )
 
-        def resolve(body):
+        def target_of(body):
             head, dot, rest = body.partition(".")
             if not dot:
-                target = None if body in ("CUBE", "TABLE", cname) else (cname, body)
-            else:
-                target = (
-                    cname if head in ("CUBE", "TABLE", cname) else head,
-                    rest,
+                return None if body in ("CUBE", "TABLE", cname) else (cname, body)
+            return (cname if head in ("CUBE", "TABLE", cname) else head, rest)
+
+        scope = f"measure '{cname}.{stack[0][1] if stack else '<unknown>'}'"
+        for target in map(target_of, _references_inside_subqueries(sql)):
+            if target is not None and self.is_measure(*target):
+                raise ConversionError(
+                    f"{scope} reads measure '{target[0]}.{target[1]}' inside a subquery, "
+                    "which has no Metric View form"
                 )
+            # Cube pastes a dimension's SQL into the subquery as written, so its bare
+            # columns bind to the subquery's own table, which the Metric View cannot match.
+            if (
+                target is not None
+                and self._dimensions.has_dimension(*target)
+                and self._dimensions.has_bare_column(*target)
+            ):
+                raise ConversionError(
+                    f"{scope} reads dimension '{target[0]}.{target[1]}' inside a subquery, "
+                    "and its SQL has a bare column that Cube binds to the subquery's own "
+                    "table; write the column as {CUBE}.column in that dimension"
+                )
+
+        def resolve(body):
+            target = target_of(body)
             if target is not None and self._dimensions.has_dimension(*target):
                 return self._dimensions.expression(*target, qualified=True)
             if (
@@ -1348,6 +1436,7 @@ class _PublicationMeasureResolver(_MeasureResolver):
             self._dataset_markers[cname],
             self._known_markers,
             f"measure '{cname}.{stack[0][1] if stack else '<unknown>'}'",
+            subqueries=True,
         )
 
 
