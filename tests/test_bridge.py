@@ -339,6 +339,41 @@ views:
     assert measures["max_profile_balance"] == "MAX(source.users.balance)"
 
 
+def test_multi_stage_ratio_without_a_stage_modifier_publishes_its_aggregates():
+    model = """
+cubes:
+  - name: adoption
+    sql_table: main.product.adoption
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: account_id, sql: account_id, type: number}
+    measures:
+      - {name: eligible, sql: "{CUBE.account_id}", type: count_distinct}
+      - name: adopted
+        sql: "case when {CUBE}.score >= 0.5 then {CUBE}.account_id end"
+        type: count_distinct
+      - name: adopted_share
+        multi_stage: true
+        sql: "{CUBE.adopted} / NULLIF({CUBE.eligible}, 0)"
+        type: number
+views:
+  - name: sales
+    cubes:
+      - {join_path: adoption, includes: [adopted_share]}
+"""
+
+    result = _convert(model)
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    measures = {item["name"]: item["expr"] for item in metric_view["measures"]}
+
+    assert measures == {
+        "adopted_share": (
+            "COUNT(DISTINCT case when source.score >= 0.5 then source.account_id end)"
+            " / NULLIF(COUNT(DISTINCT source.account_id), 0)"
+        )
+    }
+
+
 def test_joined_expression_preserves_quoted_physical_column_identifiers():
     model = _NESTED_MODEL.replace(
         "      - name: display_name\n"
