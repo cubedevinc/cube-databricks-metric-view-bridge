@@ -1276,7 +1276,15 @@ class _DimensionResolver:
             cube_name.casefold(): self._dataset_markers[cube_name]
             for cube_name in (own_cube, target)
         }
-        return qualified(_rename_column_qualifiers(out, named), own_cube)
+        condition = qualified(_rename_column_qualifiers(out, named), own_cube)
+        # A Metric View join keeps one match per row, so a condition such as
+        # '1 = 1' would keep one row where Cube keeps every row it matches.
+        if self._dataset_markers[target] not in condition:
+            raise ConversionError(
+                f"{scope} reads no column of '{target}'; a Databricks Metric View join keeps "
+                "one match per row, where Cube keeps every row this condition matches"
+            )
+        return condition
 
     def expression(self, cube_name, member_name, qualified=False, stack=()):
         key = (cube_name, member_name, qualified)

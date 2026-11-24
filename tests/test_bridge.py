@@ -960,6 +960,48 @@ def test_condition_join_reading_beyond_its_two_cubes_is_refused(condition, messa
         _convert(model)
 
 
+@pytest.mark.parametrize("condition", ["1 = 1", "{CUBE}.ordered_at >= '2020-01-01'"])
+def test_condition_join_reading_no_column_of_the_joined_cube_is_refused(condition):
+    model = _CONDITION_MODEL.replace(
+        "{CUBE}.customer_id = {customers}.id\n"
+        "          AND {CUBE}.ordered_at >= {customers}.valid_from\n"
+        "          AND {CUBE}.ordered_at < {customers}.valid_to",
+        condition,
+    )
+
+    with pytest.raises(ConversionError, match="reads no column of 'customers'"):
+        _convert(model)
+
+
+def test_cross_join_reached_only_through_a_dimension_is_refused():
+    # The view projects no customers member: the join exists only for the dimension.
+    model = (
+        _CONDITION_MODEL.replace(
+            "{CUBE}.customer_id = {customers}.id\n"
+            "          AND {CUBE}.ordered_at >= {customers}.valid_from\n"
+            "          AND {CUBE}.ordered_at < {customers}.valid_to",
+            "1 = 1",
+        )
+        .replace(
+            "      - {name: id, sql: id, type: number, primary_key: true}\n"
+            "      - {name: order_month,",
+            "      - {name: id, sql: id, type: number, primary_key: true}\n"
+            '      - {name: customer_tier, sql: "{customers.tier}", type: string}\n'
+            "      - {name: order_month,",
+        )
+        .replace(
+            "      - {join_path: orders, includes: [id, count]}\n"
+            "      - {join_path: orders.customers, includes: [tier]}\n"
+            "      - {join_path: orders.customers.regions, prefix: true, includes: [name]}\n",
+            "      - {join_path: orders, includes: [id, customer_tier, count]}\n",
+        )
+    )
+    assert "customer_tier" in model and "orders.customers," not in model
+
+    with pytest.raises(ConversionError, match="reads no column of 'customers'"):
+        _convert(model)
+
+
 def test_public_ossie_projection_does_not_carry_condition_joins():
     from cube_databricks_metric_view_bridge import convert_cube_view_to_ossie
 
