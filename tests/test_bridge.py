@@ -1540,3 +1540,45 @@ def test_star_or_measure_reference_inside_a_measure_subquery_fails_closed(refere
 
     with pytest.raises(ConversionError, match=error):
         convert_cube_view_to_databricks_metric_view({"model/usage.yml": model}, "adoption")
+
+
+_OPERATOR_DIMENSION_MODEL = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: gross, sql: "{CUBE}.price + {CUBE}.tax", type: number}
+      - {name: gross_label, sql: "{gross}", type: number}
+      - {name: is_open, sql: "{CUBE}.status = 'open' OR {CUBE}.status = 'new'", type: boolean}
+    measures:
+      - {name: doubled_gross, type: sum, sql: "{gross} * 2"}
+      - {name: doubled_label, type: sum, sql: "{gross_label} * 2"}
+      - {name: open_tax, type: sum, sql: "case when {is_open} AND {CUBE}.tax > 0 then {CUBE}.tax end"}
+      - name: open_count
+        type: count
+        filters:
+          - sql: "{is_open} AND {CUBE}.tax > 0"
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [doubled_gross, doubled_label, open_tax, open_count]}
+"""
+
+
+def test_dimension_with_a_top_level_operator_keeps_its_precedence_inside_a_measure():
+    result = _convert(_OPERATOR_DIMENSION_MODEL)
+    expressions = {
+        item["name"]: item["expr"] for item in yaml.safe_load(result.metric_view_yaml)["measures"]
+    }
+
+    assert expressions["doubled_gross"] == "SUM((source.price + source.tax) * 2)"
+    assert expressions["doubled_label"] == "SUM((source.price + source.tax) * 2)"
+    assert expressions["open_tax"] == (
+        "SUM(case when (source.status = 'open' OR source.status = 'new') "
+        "AND source.tax > 0 then source.tax end)"
+    )
+    assert (
+        "(source.status = 'open' OR source.status = 'new') AND source.tax > 0"
+        in (expressions["open_count"])
+    )
