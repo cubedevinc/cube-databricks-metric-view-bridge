@@ -82,7 +82,9 @@ with a literal or keyword like `true` or `current_date`, is published with its C
 condition as the Metric View join's `on`. Member references in the condition expand
 to their SQL. Such a join gets the same fan-out checks as an equality join and no
 `rely.at_most_one_match`. A condition that reads a cube other than the two it joins,
-a measure, or a `table.column` written without a cube reference is rejected. The
+a measure, or a `table.column` written without a cube reference is rejected. So is a
+condition that reads no column of the joined cube, such as `1 = 1`: a Metric View join
+keeps one match per row, where Cube keeps every row the condition matches. The
 intermediate Ossie artifact of
 `convert_cube_view_to_databricks_metric_view` carries such a join as a relationship
 on a carrier column, since an Ossie relationship holds only column equalities;
