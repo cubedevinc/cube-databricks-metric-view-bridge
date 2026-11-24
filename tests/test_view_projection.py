@@ -655,6 +655,70 @@ cubes:
         _project(text)
 
 
+_MULTI_STAGE_RATIO_MODEL = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - {{name: id, sql: id, type: number, primary_key: true}}
+    measures:
+      - {{name: paid, sql: "case when {{CUBE}}.paid then {{CUBE}}.id end", type: count_distinct}}
+      - {{name: total, sql: id, type: count_distinct}}
+      - name: paid_share
+        multi_stage: true
+        sql: "{{CUBE.paid}} / NULLIF({{total}}, 0)"
+        type: {measure_type}
+{extra}views:
+  - name: sales
+    cubes:
+      - {{join_path: orders, includes: [{selected}]}}
+"""
+
+
+@pytest.mark.parametrize("hidden_dependency", [False, True])
+def test_multi_stage_number_measure_without_a_stage_modifier_publishes_as_calculated(
+    hidden_dependency,
+):
+    selected = "published" if hidden_dependency else "paid_share"
+    extra = (
+        '      - {name: published, sql: "{paid_share} * 100", type: number}\n'
+        if hidden_dependency
+        else ""
+    )
+    text = _MULTI_STAGE_RATIO_MODEL.format(measure_type="number", extra=extra, selected=selected)
+
+    out, _, issues = _project(text)
+
+    ratio = "COUNT(DISTINCT case when orders.paid then orders.id end) / NULLIF(COUNT(DISTINCT orders.id), 0)"
+    metrics = by_name(model_of(out)["metrics"])
+    assert set(metrics) == {selected}
+    assert expr_of(metrics[selected]) == (f"({ratio}) * 100" if hidden_dependency else ratio)
+    assert not list(issues)
+
+
+@pytest.mark.parametrize(
+    ("measure_type", "stage_property", "rejected"),
+    [
+        ("number", "        time_shift: [{interval: 1 month, type: prior}]\n", "time_shift"),
+        ("number", "        group_by: [id]\n", "group_by"),
+        ("rank", "", "multi_stage"),
+    ],
+)
+def test_multi_stage_measure_with_a_stage_modifier_or_non_number_type_is_rejected(
+    measure_type,
+    stage_property,
+    rejected,
+):
+    text = _MULTI_STAGE_RATIO_MODEL.format(
+        measure_type=measure_type,
+        extra=stage_property,
+        selected="paid_share",
+    )
+
+    with pytest.raises(ConversionError, match=rf"multi-stage properties \(.*{rejected}"):
+        _project(text)
+
+
 @pytest.mark.parametrize(
     ("property_name", "property_value"),
     [

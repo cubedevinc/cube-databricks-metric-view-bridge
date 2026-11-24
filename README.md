@@ -28,7 +28,11 @@ Publication is deliberately conservative. It rejects ambiguous/multi-root view
 graphs, split views, name collisions, and selected members without a faithful
 static form. Fan-out-unsafe metrics are rejected by default. Rolling-window and
 multi-stage measure properties are rejected until they can be lowered without
-changing grain or time-shift semantics. Metric expressions must be statically
+changing grain or time-shift semantics. The exception is a `multi_stage: true`
+measure of `type: number` with no `group_by`, `reduce_by`, `add_group_by`,
+`time_shift` or `grain`: Cube computes it from the measures it references at the
+query's grain, so it publishes as the same calculated measure without `multi_stage`
+would. Metric expressions must be statically
 parseable without nested query or lambda binding scopes so the bridge can prove the
 source dataset of every physical column. Joined-dataset references retain their
 Cube reference provenance; a physical multipart column is never inferred to be a

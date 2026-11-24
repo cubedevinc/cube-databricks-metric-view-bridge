@@ -413,6 +413,10 @@ def _project_cubes(cubes, required, joins, needed_measures):
             for measure in _as_named_list(cube.get("measures"), f"cube '{cube_name}' measures")
             if (cube_name, measure.get("name")) in needed_measures
         ]
+        for measure in cube["measures"]:
+            # _measure_closure admits multi_stage only on a calculated measure with no
+            # stage modifier; the Ossie converter would otherwise park it.
+            measure.pop("multi_stage", None)
         projected[cube_name] = cube
     return projected
 
@@ -616,6 +620,12 @@ def _active_multi_stage_properties(measure, cube_name, measure_name):
             )
         if value:
             active.append("grain")
+
+    measure_type = str(measure.get("type") or "").lower()
+    if active == ["multi_stage"] and measure_type == "number":
+        # With no stage modifier, Cube computes a number measure from the measures it
+        # references at the query's grain: the same result as a calculated measure.
+        return []
     return active
 
 
