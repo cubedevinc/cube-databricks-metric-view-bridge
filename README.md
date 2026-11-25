@@ -32,7 +32,11 @@ changing grain or time-shift semantics. The exception is a `multi_stage: true`
 measure of `type: number` with no `group_by`, `reduce_by`, `add_group_by`,
 `time_shift` or `grain`: Cube computes it from the measures it references at the
 query's grain, so it publishes as the same calculated measure without `multi_stage`
-would. Metric expressions must be statically
+would. With `strict_multi_stage=False`, a selected measure that uses one of these
+properties or `rolling_window`, or references such a measure through other
+measures, is left out of the view and reported as a `MULTI_STAGE_MEASURE_PARKED`
+issue naming it, and the rest of the view converts; a view left with no member is
+still refused. Metric expressions must be statically
 parseable without lambda binding scopes so the bridge can prove the source dataset
 of every physical column. A measure may contain a subquery, such as a correlated
 `{CUBE}.id IN (SELECT id FROM t WHERE t.ts = {CUBE}.ts)`. The subquery's own

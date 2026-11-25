@@ -376,6 +376,36 @@ views:
     }
 
 
+def test_non_strict_multi_stage_publishes_the_view_without_the_parked_measures():
+    model = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - {name: revenue, sql: amount, type: sum}
+      - name: revenue_prior_year
+        multi_stage: true
+        sql: "{revenue}"
+        type: number
+        time_shift: [{interval: 1 year, type: prior}]
+views:
+  - name: sales
+    cubes:
+      - {join_path: orders, includes: [id, revenue, revenue_prior_year]}
+"""
+
+    result = _convert(model, strict_multi_stage=False)
+
+    metric_view = yaml.safe_load(result.metric_view_yaml)
+    assert [item["name"] for item in metric_view["measures"]] == ["revenue"]
+    cube_issues = [item for item in result.issues if item.origin == "ossie_cube"]
+    assert [(item.code, item.element) for item in cube_issues] == [
+        ("MULTI_STAGE_MEASURE_PARKED", "orders.revenue_prior_year")
+    ]
+
+
 def test_joined_expression_preserves_quoted_physical_column_identifiers():
     model = _NESTED_MODEL.replace(
         "      - name: display_name\n"

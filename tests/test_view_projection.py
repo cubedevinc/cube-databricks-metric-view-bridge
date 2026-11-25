@@ -719,6 +719,122 @@ def test_multi_stage_measure_with_a_stage_modifier_or_non_number_type_is_rejecte
         _project(text)
 
 
+_PARKED_MODEL = """
+cubes:
+  - name: orders
+    sql_table: main.sales.orders
+    joins:
+      - {name: users, sql: "{CUBE}.user_id = {users}.id", relationship: many_to_one}
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: created_at, sql: created_at, type: time}
+    measures:
+      - {name: count, type: count}
+      - {name: revenue, sql: amount, type: sum}
+      - name: revenue_prior_year
+        multi_stage: true
+        sql: "{revenue}"
+        type: number
+        time_shift: [{interval: 1 year, type: prior}]
+      - {name: yoy, sql: "{revenue} / NULLIF({CUBE.revenue_prior_year}, 0)", type: number}
+      - {name: yoy_pct, sql: "{yoy} * 100", type: number}
+      - name: trailing_revenue
+        sql: amount
+        type: sum
+        rolling_window: {trailing: 7 day}
+      - name: grew
+        type: count
+        filters: [{sql: "{revenue_prior_year} > 0"}]
+      - {name: per_user_prior, sql: "{revenue} / {CUBE.users.signups_prior_year}", type: number}
+  - name: users
+    sql_table: main.sales.users
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+    measures:
+      - {name: signups, type: count}
+      - name: signups_prior_year
+        multi_stage: true
+        sql: "{signups}"
+        type: number
+        time_shift: [{interval: 1 year, type: prior}]
+views:
+  - name: sales
+    cubes:
+      - join_path: orders
+        includes: {includes}
+"""
+
+_PARKED = [
+    "revenue_prior_year",
+    "yoy",
+    "yoy_pct",
+    "trailing_revenue",
+    "grew",
+    "per_user_prior",
+]
+
+
+def test_non_strict_multi_stage_parks_each_measure_that_reaches_one():
+    text = _PARKED_MODEL.replace("{includes}", str(["id", "count", "revenue", *_PARKED]))
+
+    out, _, issues = _project(text, strict_multi_stage=False)
+
+    assert set(by_name(model_of(out)["metrics"])) == {"count", "revenue"}
+    parked = {
+        issue.element_name: issue.detail
+        for issue in issues.of_type(IssueType.MULTI_STAGE_MEASURE_PARKED)
+    }
+    assert set(parked) == {f"orders.{name}" for name in _PARKED}
+    assert "time_shift" in parked["orders.revenue_prior_year"]
+    assert "rolling_window" in parked["orders.trailing_revenue"]
+    # A dependent names the measure that blocks it, also through a join path.
+    assert "'orders.revenue_prior_year'" in parked["orders.yoy_pct"]
+    assert "'users.signups_prior_year'" in parked["orders.per_user_prior"]
+
+
+def test_non_strict_multi_stage_keeps_refusing_by_default_and_when_nothing_is_left():
+    with pytest.raises(ConversionError, match="multi-stage properties"):
+        _project(_PARKED_MODEL.replace("{includes}", str(["id", "count", "yoy"])))
+    with pytest.raises(ConversionError, match="multi-stage properties"):
+        _project(
+            _PARKED_MODEL.replace("{includes}", str(["revenue_prior_year"])),
+            strict_multi_stage=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "{joinPath: orders, includes: [id, count, yoy]}",
+        "{join_path: orders, includes: [id, count, revenue, yoy], excludes: [revenue]}",
+        "{join_path: orders, includes: '*', excludes: [created_at]}",
+        "{join_path: orders, prefix: true, includes: [id, count, {name: yoy, alias: growth}]}",
+    ],
+)
+def test_non_strict_multi_stage_excludes_through_any_view_entry_shape(entry):
+    view = "      - join_path: orders\n        includes: {includes}\n"
+    assert view in _PARKED_MODEL
+    text = _PARKED_MODEL.replace(view, f"      - {entry}\n")
+
+    out, _, issues = _project(text, strict_multi_stage=False)
+
+    metrics = set(by_name(model_of(out)["metrics"]))
+    parked = {issue.element_name for issue in issues.of_type(IssueType.MULTI_STAGE_MEASURE_PARKED)}
+    assert "orders.yoy" in parked
+    assert metrics.isdisjoint({name.split(".")[1] for name in parked})
+    assert metrics & {"count", "orders_count"}
+
+
+def test_non_strict_multi_stage_keeps_refusing_a_malformed_property():
+    text = _PARKED_MODEL.replace(
+        "time_shift: [{interval: 1 year, type: prior}]\n      - {name: yoy,",
+        "time_shift: {}\n      - {name: yoy,",
+    ).replace("{includes}", str(["id", "count", "yoy"]))
+
+    with pytest.raises(ConversionError, match="malformed time_shift"):
+        _project(text, strict_multi_stage=False)
+
+
 @pytest.mark.parametrize(
     ("property_name", "property_value"),
     [
