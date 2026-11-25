@@ -702,9 +702,13 @@ def _declared_join_paths(cubes, start, target):
 class _NoPublicationForm(ConversionError):
     """The first measure a closure reaches that no Metric View can compute."""
 
-    def __init__(self, message, measure):
-        super().__init__(message)
+    def __init__(self, measure, feature):
+        super().__init__(
+            f"measure '{measure[0]}.{measure[1]}' {feature} with no faithful Databricks Metric "
+            "View publication form"
+        )
         self.measure = measure
+        self.feature = feature
 
 
 def _unpublishable_measures(cubes, selected):
@@ -720,11 +724,12 @@ def _unpublishable_measures(cubes, selected):
         try:
             _measure_closure(cubes, {key})
         except _NoPublicationForm as refusal:
+            root = refusal.measure
             parked[key] = (
                 str(refusal)
-                if refusal.measure == key
-                else f"measure '{key[0]}.{key[1]}' depends on a measure that cannot be "
-                f"published: {refusal}"
+                if root == key
+                else f"measure '{key[0]}.{key[1]}' depends on measure '{root[0]}.{root[1]}', "
+                f"which {refusal.feature} with no faithful Databricks Metric View publication form"
             )
     return parked
 
@@ -754,11 +759,7 @@ def _measure_closure(cubes, initial):
         if measure is None:
             continue
         if measure.get("rolling_window") is not None:
-            raise _NoPublicationForm(
-                f"measure '{cube_name}.{measure_name}' uses rolling_window, which has "
-                "no faithful Databricks Metric View publication form",
-                (cube_name, measure_name),
-            )
+            raise _NoPublicationForm((cube_name, measure_name), "uses rolling_window")
         unsupported_multi_stage = _active_multi_stage_properties(
             measure,
             cube_name,
@@ -767,10 +768,8 @@ def _measure_closure(cubes, initial):
         if unsupported_multi_stage:
             properties = ", ".join(unsupported_multi_stage)
             raise _NoPublicationForm(
-                f"measure '{cube_name}.{measure_name}' uses unsupported Cube multi-stage "
-                f"properties ({properties}), which have no faithful Databricks Metric View "
-                "publication form",
                 (cube_name, measure_name),
+                f"uses unsupported Cube multi-stage properties ({properties})",
             )
         for text in _measure_expression_texts(measure):
             for target in _member_references(text, cube_name, cubes):
