@@ -802,6 +802,29 @@ def test_non_strict_multi_stage_keeps_refusing_by_default_and_when_nothing_is_le
         )
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "{joinPath: orders, includes: [id, count, yoy]}",
+        "{join_path: orders, includes: [id, count, revenue, yoy], excludes: [revenue]}",
+        "{join_path: orders, includes: '*', excludes: [created_at]}",
+        "{join_path: orders, prefix: true, includes: [id, count, {name: yoy, alias: growth}]}",
+    ],
+)
+def test_non_strict_multi_stage_excludes_through_any_view_entry_shape(entry):
+    view = "      - join_path: orders\n        includes: {includes}\n"
+    assert view in _PARKED_MODEL
+    text = _PARKED_MODEL.replace(view, f"      - {entry}\n")
+
+    out, _, issues = _project(text, strict_multi_stage=False)
+
+    metrics = set(by_name(model_of(out)["metrics"]))
+    parked = {issue.element_name for issue in issues.of_type(IssueType.MULTI_STAGE_MEASURE_PARKED)}
+    assert "orders.yoy" in parked
+    assert metrics.isdisjoint({name.split(".")[1] for name in parked})
+    assert metrics & {"count", "orders_count"}
+
+
 def test_non_strict_multi_stage_keeps_refusing_a_malformed_property():
     text = _PARKED_MODEL.replace(
         "time_shift: [{interval: 1 year, type: prior}]\n      - {name: yoy,",

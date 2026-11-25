@@ -129,7 +129,9 @@ def _convert_cube_view_to_ossie_with_provenance(
     parked = {} if strict_multi_stage else _unpublishable_measures(cubes, selected)
     if parked:
         if all((member.cube, member.source_name) in parked for member in selected):
-            raise ConversionError(next(iter(parked.values())))
+            raise ConversionError(
+                f"view '{view}' has no member left to publish: " + "; ".join(parked.values())
+            )
         selected_view = _excluding(selected_view, parked)
         selected, paths, required_cubes, joins = _resolve_view(selected_view, view, cubes)
 
