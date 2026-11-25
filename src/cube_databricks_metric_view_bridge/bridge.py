@@ -92,6 +92,7 @@ def convert_cube_view_to_databricks_metric_view(
     *,
     source: str | None = None,
     strict_fanout: bool = True,
+    strict_multi_stage: bool = True,
     expected_data_source: str | None = None,
     default_catalog: str | None = None,
     default_schema: str | None = None,
@@ -110,6 +111,7 @@ def convert_cube_view_to_databricks_metric_view(
             source=source,
             strict_fanout=strict_fanout,
             metric_view=True,
+            strict_multi_stage=strict_multi_stage,
         )
     )
     document = yaml.safe_load(projected)

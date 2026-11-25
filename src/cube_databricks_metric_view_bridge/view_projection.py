@@ -74,7 +74,9 @@ class _ProjectionProvenance:
     join_conditions: dict[str, tuple[str, str, str]]
 
 
-def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
+def convert_cube_view_to_ossie(
+    files, view, source=None, strict_fanout=True, strict_multi_stage=True
+):
     """Convert one Cube view's public projection to Apache Ossie YAML.
 
     Returns ``(ossie_yaml_str, resolved_source, IssueLog)``. ``resolved_source``
@@ -87,18 +89,25 @@ def convert_cube_view_to_ossie(files, view, source=None, strict_fanout=True):
     emitted, and Cube view aliases/prefixes become their Ossie names.  Unsafe
     fan-out is strict by default because publishing a metric that can over-count
     is worse than refusing it with a precise error.
+
+    A selected measure with no faithful Metric View form (a stage modifier, a
+    non-``number`` multi-stage type or ``rolling_window``), or one that reaches
+    such a measure through its references, refuses the view by default. With
+    ``strict_multi_stage=False`` each such measure is left out and reported as a
+    ``MULTI_STAGE_MEASURE_PARKED`` issue naming it, and the rest converts.
     """
     projected, resolved_source, issues, _ = _convert_cube_view_to_ossie_with_provenance(
         files,
         view,
         source=source,
         strict_fanout=strict_fanout,
+        strict_multi_stage=strict_multi_stage,
     )
     return projected, resolved_source, issues
 
 
 def _convert_cube_view_to_ossie_with_provenance(
-    files, view, source=None, strict_fanout=True, metric_view=False
+    files, view, source=None, strict_fanout=True, metric_view=False, strict_multi_stage=True
 ):
     if not isinstance(files, dict) or not files:
         raise ConversionError("expected a non-empty mapping of {filename: YAML}")
@@ -117,6 +126,12 @@ def _convert_cube_view_to_ossie_with_provenance(
 
     selected_view = views[view]
     selected, paths, required_cubes, joins = _resolve_view(selected_view, view, cubes)
+    parked = {} if strict_multi_stage else _unpublishable_measures(cubes, selected)
+    if parked:
+        if all((member.cube, member.source_name) in parked for member in selected):
+            raise ConversionError(next(iter(parked.values())))
+        selected_view = _excluding(selected_view, parked)
+        selected, paths, required_cubes, joins = _resolve_view(selected_view, view, cubes)
 
     needed_measures = _measure_closure(
         cubes,
@@ -170,6 +185,8 @@ def _convert_cube_view_to_ossie_with_provenance(
     issues = _publication_issues(
         collection_issues, conversion_issues, selected, required_cubes, source_grain
     )
+    for (cube_name, measure_name), message in parked.items():
+        issues.add(IssueType.MULTI_STAGE_MEASURE_PARKED, f"{cube_name}.{measure_name}", message)
     if strict_fanout:
         unsafe = issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)
         if unsafe:
@@ -682,6 +699,48 @@ def _declared_join_paths(cubes, start, target):
     return [first]
 
 
+class _NoPublicationForm(ConversionError):
+    """The first measure a closure reaches that no Metric View can compute."""
+
+    def __init__(self, message, measure):
+        super().__init__(message)
+        self.measure = measure
+
+
+def _unpublishable_measures(cubes, selected):
+    """Each selected measure that reaches a measure with no Metric View form, with why."""
+    measures = [(item.cube, item.source_name) for item in selected if item.kind == "measure"]
+    try:
+        _measure_closure(cubes, set(measures))
+        return {}
+    except _NoPublicationForm:
+        pass
+    parked = {}
+    for key in dict.fromkeys(measures):
+        try:
+            _measure_closure(cubes, {key})
+        except _NoPublicationForm as refusal:
+            parked[key] = (
+                str(refusal)
+                if refusal.measure == key
+                else f"measure '{key[0]}.{key[1]}' depends on a measure that cannot be "
+                f"published: {refusal}"
+            )
+    return parked
+
+
+def _excluding(view, measures):
+    """The view with these (cube, measure) pairs added to its entries' own excludes."""
+    result = copy.deepcopy(view)
+    for entry in result.get("cubes") or []:
+        leaf = str(snake_keys(entry).get("join_path") or "").split(".")[-1]
+        excludes = list(entry.get("excludes") or [])
+        entry["excludes"] = excludes + [
+            name for cube_name, name in measures if cube_name == leaf and name not in excludes
+        ]
+    return result
+
+
 def _measure_closure(cubes, initial):
     measures = {}
     for cube_name, cube in cubes.items():
@@ -695,9 +754,10 @@ def _measure_closure(cubes, initial):
         if measure is None:
             continue
         if measure.get("rolling_window") is not None:
-            raise ConversionError(
+            raise _NoPublicationForm(
                 f"measure '{cube_name}.{measure_name}' uses rolling_window, which has "
-                "no faithful Databricks Metric View publication form"
+                "no faithful Databricks Metric View publication form",
+                (cube_name, measure_name),
             )
         unsupported_multi_stage = _active_multi_stage_properties(
             measure,
@@ -706,10 +766,11 @@ def _measure_closure(cubes, initial):
         )
         if unsupported_multi_stage:
             properties = ", ".join(unsupported_multi_stage)
-            raise ConversionError(
+            raise _NoPublicationForm(
                 f"measure '{cube_name}.{measure_name}' uses unsupported Cube multi-stage "
                 f"properties ({properties}), which have no faithful Databricks Metric View "
-                "publication form"
+                "publication form",
+                (cube_name, measure_name),
             )
         for text in _measure_expression_texts(measure):
             for target in _member_references(text, cube_name, cubes):
