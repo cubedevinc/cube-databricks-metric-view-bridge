@@ -48,7 +48,7 @@ wheels = [
 
 [[package]]
 name = "cube-databricks-metric-view-bridge"
-version = "0.14.0"
+version = "0.15.0"
 source = { editable = "." }
 dependencies = [
     { name = "apache-ossie" },

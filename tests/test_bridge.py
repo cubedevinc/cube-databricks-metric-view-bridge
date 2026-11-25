@@ -138,12 +138,12 @@ def test_catalog_and_schema_qualify_one_part_source():
         (
             _NESTED_MODEL.replace("main.sales.", "sales."),
             {},
-            "provide default_catalog",
+            "is not catalog-qualified.*or set a default catalog",
         ),
         (
             _NESTED_MODEL.replace("main.sales.", ""),
             {"default_catalog": "analytics"},
-            "provide default_schema",
+            "has no schema. Write sql_table on cube .orders. as catalog.schema.table",
         ),
     ],
 )
@@ -505,8 +505,9 @@ def test_unsafe_joined_dimension_expressions_fail_closed(expression):
         f'sql: "{expression}"',
     )
 
-    with pytest.raises(ConversionError, match="refusing to return a publishable"):
+    with pytest.raises(ConversionError, match="cannot qualify safely") as refused:
         _convert(model)
+    assert refused.value.code == "CUBE_MEMBER_SQL_UNSUPPORTED"
 
 
 def test_non_root_source_override_updates_source_join_direction_and_qualification():
@@ -577,8 +578,9 @@ def test_unparseable_joined_expression_is_not_silently_claimed_as_fixed():
         "sql: \"CONCAT({name}, ' (', {code}, ')')\"",
         'sql: "value @@ not valid sql"',
     )
-    with pytest.raises(ConversionError, match="refusing to return a publishable"):
+    with pytest.raises(ConversionError, match="cannot qualify safely") as refused:
         _convert(model)
+    assert refused.value.code == "CUBE_MEMBER_SQL_UNSUPPORTED"
 
 
 def test_metric_with_a_lambda_returns_no_publishable_artifact():
@@ -1841,9 +1843,10 @@ def test_number_measure_reading_a_column_outside_an_aggregate_is_refused(conditi
     with pytest.raises(
         ConversionError,
         match=rf"measure 'tiered' reads {re.escape(column)} outside an aggregate.*"
-        "move the condition inside the aggregate",
-    ):
+        "Move the condition on .* inside the aggregate of measure 'tiered'",
+    ) as refused:
         _convert(model)
+    assert refused.value.code == "CUBE_MEMBER_SQL_UNSUPPORTED"
 
 
 def test_number_measure_with_the_condition_inside_the_aggregate_publishes():

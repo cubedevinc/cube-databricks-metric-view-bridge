@@ -185,6 +185,31 @@ for issue in result.issues:
 The result preserves both the normalized Ossie artifact and final Metric View YAML
 so callers can verify that the selected public-member contract did not change.
 
+## Refusals
+
+A view the bridge cannot publish faithfully raises `Refusal`, a subclass of the
+Ossie `ConversionError`. `Refusal.code` names its family, `Refusal.fix` is one
+sentence saying what to change in the Cube model, and the message ends with that
+sentence. Each family shares one remedy:
+
+| Code | Refused when | Fix |
+| --- | --- | --- |
+| `CUBE_VIEW_NOT_FOUND` | The requested view is not in the model. | Publish a view the model defines. |
+| `CUBE_VIEW_INVALID` | The view definition is malformed. | Correct the named view entry. |
+| `CUBE_MODEL_INVALID` | A cube definition is malformed or cyclic. | Correct the named cube or member. |
+| `CUBE_VIEW_JOIN_PATH_UNSUPPORTED` | The view has several roots, or reaches a cube along more than one path. | One root, one `join_path` per cube. |
+| `CUBE_VIEW_JOIN_NOT_REPRESENTABLE` | A join or fan-out a Metric View join cannot hold. | Change the join condition, or publish a view rooted at the joined cube. |
+| `CUBE_MEMBER_UNSUPPORTED` | A selected segment, hierarchy, geo, switch or sub_query dimension, custom granularity, split view entry, or measure with no Metric View form. | Leave the member out of the view. |
+| `CUBE_MEMBER_SQL_UNSUPPORTED` | A member's SQL cannot be qualified or rendered for one Metric View namespace. | Rewrite the named member's SQL, or leave it out. |
+| `CUBE_MEMBER_NAME_CONFLICT` | Published names or join aliases collide ignoring case, or dimensions read each other's names. | Rename one in the view. |
+| `CUBE_PRIMARY_KEY_REQUIRED` | A bare `count` measure's cube has no primary key. | Mark the key dimension `primary_key: true`. |
+| `CUBE_SOURCE_UNSUPPORTED` | A cube's `sql_table` or `sql` is not a static table or SELECT. | Use `catalog.schema.table` or a plain SELECT. |
+| `CUBE_DATA_SOURCE_MISMATCH` | A cube belongs to another data source than the one requested. | Align the cube's `data_source`. |
+| `CUBE_VIEW_FULLY_WITHHELD` | No selected member has a Metric View form. | Include at least one publishable member. |
+| `CUBE_VIEW_PROJECTION_FAILED` | A caller error, or converter output the bridge cannot trust. | Report the view; nothing in the model is known to cause it. |
+
+`ConversionError`s raised inside the Ossie converters carry no family yet.
+
 ## Dependency and provenance policy
 
 The distributable package metadata and development lockfile pin Apache Ossie core,
