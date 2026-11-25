@@ -162,6 +162,8 @@ def _convert_cube_view_to_ossie_with_provenance(
         {cube for member in needed_members for cube in plain_references.get(member, ())},
     )
     resolved_source = _resolve_source(view, source, paths[0][0], required_cubes)
+    if metric_view:
+        required_cubes, joins = _nest_third_cube_joins(cubes, required_cubes, joins)
     projected_cubes = _project_cubes(cubes, required_cubes, joins, needed_measures)
     carriers = _condition_join_carriers(projected_cubes) if metric_view else {}
     synthetic = dump_yaml(
@@ -211,7 +213,7 @@ def _resolve_view(view, view_name, cubes):
     paths = []
     required = []
     joins = {}
-    parent_of = {}
+    path_to = {}
     path_of = {}
     for index, raw_entry in enumerate(entries):
         if not isinstance(raw_entry, dict):
@@ -246,15 +248,17 @@ def _resolve_view(view, view_name, cubes):
         prior_path = path_of.setdefault(leaf, tuple(parts))
         if prior_path != tuple(parts):
             raise ConversionError(
-                f"view '{view_name}': cube '{leaf}' is reached through multiple "
-                "join paths; publication would make its member expressions ambiguous"
+                f"view '{view_name}': cube '{leaf}' is reached through join paths "
+                f"'{'.'.join(prior_path)}' and '{join_path}'; publication would make its "
+                "member expressions ambiguous"
             )
-        for left, right in zip(parts, parts[1:], strict=False):
-            prior_parent = parent_of.setdefault(right, left)
-            if prior_parent != left:
+        for index, (left, right) in enumerate(zip(parts, parts[1:], strict=False)):
+            prior = path_to.setdefault(right, parts[: index + 2])
+            if prior[-2] != left:
                 raise ConversionError(
-                    f"view '{view_name}': cube '{right}' has multiple parents; "
-                    "diamond join projections are not supported"
+                    f"view '{view_name}': cube '{right}' is reached through join paths "
+                    f"'{'.'.join(prior)}' and '{'.'.join(parts[: index + 2])}'; diamond "
+                    "join projections are not supported"
                 )
             join = _find_join(cubes[left], left, right)
             joins.setdefault(left, {})[right] = join
@@ -648,12 +652,115 @@ def _expand_dependency_graph(
             right not in expanded_joins.get(left, {})
             for left, right in zip(path, path[1:], strict=False)
         ):
+            reached = [path[-1]]
+            while reached[-1] in parent_of:
+                reached.append(parent_of[reached[-1]])
+            other = (
+                f"; they reach '{path[-1]}' through '{'.'.join(reversed(reached))}'"
+                if path[-1] in expanded_required
+                else ""
+            )
             raise ConversionError(
                 f"view '{view_name}': selected members read cube '{path[-1]}' through join "
-                f"path '{'.'.join(path)}', which the view's joins do not follow; a Metric "
-                "View joins each cube along one path"
+                f"path '{'.'.join(path)}', which the view's joins do not follow{other}; a "
+                "Metric View joins each cube along one path"
             )
     return expanded_required, expanded_joins
+
+
+def _nest_third_cube_joins(cubes, required, joins):
+    """Move a join whose condition reads a third cube under that cube.
+
+    Cube runs `R -> X ON {Y}.a = {X}.b` after `R -> Y`, while a Metric View join's
+    `on` reads only its parent and itself. When the condition reads no column of R
+    and R reaches Y and X by to-one joins, joining X under Y matches the same rows.
+    Any other third-cube condition is left for the join condition check to refuse.
+    """
+
+    def is_to_one(join):
+        relationship = _RELATIONSHIP_ALIASES.get(snake(str(join.get("relationship") or "")))
+        return relationship in ("many_to_one", "one_to_one")
+
+    required = list(required)
+    joins = {cube_name: dict(targets) for cube_name, targets in joins.items()}
+    resolver = None
+    for own, target, join in [
+        (own, target, join) for own, targets in joins.items() for target, join in targets.items()
+    ]:
+        reads = _join_condition_reads(join.get("sql"), own, cubes)
+        if (
+            reads is None
+            or own in reads
+            or target not in reads
+            or len(reads) != 2
+            or not is_to_one(join)
+        ):
+            continue
+        (third,) = reads - {target}
+        if third in required:
+            hop = joins[own].get(third)
+        else:
+            declared = [
+                item
+                for item in _as_named_list(cubes[own].get("joins"), f"cube '{own}' joins")
+                if item.get("name") == third
+            ]
+            hop = declared[0] if len(declared) == 1 else None
+        if hop is None or not is_to_one(hop):
+            continue
+        # The members it reads must read only their own cube, or the moved join would
+        # read R again; such a condition stays on R and is refused there.
+        resolver = resolver or _DimensionResolver(cubes, _dataset_markers(cubes))
+        try:
+            resolver.join_condition(third, target, join["sql"])
+        except ConversionError:
+            continue
+        if third not in required:
+            required.append(third)
+            joins[own][third] = hop
+        del joins[own][target]
+        joins.setdefault(third, {})[target] = join
+    return required, joins
+
+
+def _join_condition_reads(sql, own_cube, cubes):
+    """The cubes a join condition reads, or None when one of its columns is unattributed.
+
+    As in Cube, a bare column or member belongs to the declaring cube, and a raw
+    `cube.column` reads that cube's table.
+    """
+
+    if not isinstance(sql, str):
+        return None
+    try:
+        tree, sentinels = _parse_masked(sql)
+    except SqlglotError:
+        return None
+    names = {cube_name.casefold(): cube_name for cube_name in cubes}
+    reads = set()
+    for column in tree.find_all(exp.Column):
+        _, parts = _complete_column_path(column)
+        if not parts:
+            return None
+        head = parts[0].name
+        if head in sentinels:
+            body = sentinels[head]
+            first, dot, rest = body.partition(".")
+            if first in ("CUBE", "TABLE", own_cube) or (
+                not dot and _cube_has_member(cubes[own_cube], own_cube, body)
+            ):
+                reads.add(own_cube)
+            elif first in cubes and "." not in rest:
+                reads.add(first)
+            else:
+                return None
+        elif len(parts) == 1:
+            reads.add(own_cube)
+        elif head.casefold() in names:
+            reads.add(names[head.casefold()])
+        else:
+            return None
+    return reads
 
 
 def _declared_join_paths(cubes, start, target):

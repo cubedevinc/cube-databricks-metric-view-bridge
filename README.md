@@ -96,8 +96,14 @@ dates (SCD2), an expression like `CAST(...)` or `date_trunc(...)`, or a comparis
 with a literal or keyword like `true` or `current_date`, is published with its Cube
 condition as the Metric View join's `on`. Member references in the condition expand
 to their SQL. Such a join gets the same fan-out checks as an equality join and no
-`rely.at_most_one_match`. A condition that reads a cube other than the two it joins,
-a measure, or a `table.column` written without a cube reference is rejected. So is a
+`rely.at_most_one_match`. A join `R -> X` whose condition reads one other cube `Y`
+and no column of `R`, such as `{Y}.plan = {X}.plan_name`, is published nested under
+`Y` when `R -> X` and `R -> Y` are both `many_to_one` or `one_to_one`: Cube joins `Y`
+first, and a Metric View join's `on` reads only its parent and itself. The `R -> Y`
+join is published even when the view selects nothing of `Y`. Any other condition that
+reads a cube other than the two it joins, a condition that reads a measure, and a
+`table.column` written without a cube reference are rejected, and so is a view that
+also reaches `X` through another join path. So is a
 condition that reads no column of the joined cube, such as `1 = 1`: a Metric View join
 keeps one match per row, where Cube keeps every row the condition matches. The
 intermediate Ossie artifact of
