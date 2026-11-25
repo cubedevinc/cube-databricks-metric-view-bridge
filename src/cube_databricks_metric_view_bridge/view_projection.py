@@ -53,6 +53,8 @@ from sqlglot import Dialect, exp, parse_one
 from sqlglot.errors import SqlglotError
 from sqlglot.tokens import TokenType
 
+from .refusal import REPORT_FIX, Refusal, RefusalCode, leave_out
+
 
 @dataclasses.dataclass(frozen=True)
 class _SelectedMember:
@@ -110,30 +112,48 @@ def _convert_cube_view_to_ossie_with_provenance(
     files, view, source=None, strict_fanout=True, metric_view=False, strict_multi_stage=True
 ):
     if not isinstance(files, dict) or not files:
-        raise ConversionError("expected a non-empty mapping of {filename: YAML}")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            "expected a non-empty mapping of {filename: YAML}",
+            REPORT_FIX,
+        )
     if not isinstance(view, str) or not view.strip():
-        raise ConversionError("view projection requires a non-empty view name")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            "view projection requires a non-empty view name",
+            REPORT_FIX,
+        )
 
     collection_issues = IssueLog()
     cubes, _, views, _, _ = _collect(files, collection_issues)
     cubes, path_references, plain_references = _inline_join_path_references(cubes)
     if view not in views:
-        raise ConversionError(
-            f"requested view '{view}' not found; views present: {sorted(views) or 'none'}"
+        raise Refusal(
+            RefusalCode.VIEW_NOT_FOUND,
+            f"requested view '{view}' not found; views present: {sorted(views) or 'none'}",
+            f"Check the view name, or deploy a model that defines view '{view}'.",
         )
     if not cubes:
-        raise ConversionError("view projection requires the cubes referenced by the view")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            "view projection requires the cubes referenced by the view",
+            REPORT_FIX,
+        )
 
     selected_view = views[view]
     selected, paths, required_cubes, joins = _resolve_view(selected_view, view, cubes)
     parked = {} if strict_multi_stage else _unpublishable_measures(cubes, selected)
     if parked:
         if all((member.cube, member.source_name) in parked for member in selected):
-            raise ConversionError(
-                f"view '{view}' has no member left to publish: " + "; ".join(parked.values())
+            raise Refusal(
+                RefusalCode.VIEW_FULLY_WITHHELD,
+                f"view '{view}' has no member left to publish: " + "; ".join(parked.values()),
+                f"Include at least one member with a Metric View form in view '{view}'.",
             )
         selected_view = _excluding(selected_view, parked)
         selected, paths, required_cubes, joins = _resolve_view(selected_view, view, cubes)
+    if metric_view:
+        _refuse_custom_granularities(view, cubes, selected)
 
     needed_measures = _measure_closure(
         cubes,
@@ -194,7 +214,12 @@ def _convert_cube_view_to_ossie_with_provenance(
     if strict_fanout:
         unsafe = issues.of_type(IssueType.FANOUT_UNSAFE_METRIC)
         if unsafe:
-            raise ConversionError(f"{unsafe[0]} (refused under strict mode)")
+            raise Refusal(
+                RefusalCode.VIEW_JOIN_NOT_REPRESENTABLE,
+                f"{unsafe[0]} (refused under strict mode)",
+                f"Publish measure '{unsafe[0].element_name}' from a view whose joins from its "
+                "cube are all many_to_one or one_to_one, or leave it out of the view.",
+            )
 
     return (
         dump_yaml({"version": OSSIE_VERSION, "semantic_model": [model]}),
@@ -207,7 +232,11 @@ def _convert_cube_view_to_ossie_with_provenance(
 def _resolve_view(view, view_name, cubes):
     entries = view.get("cubes") or []
     if not isinstance(entries, list) or not entries:
-        raise ConversionError(f"view '{view_name}' has no cube projections")
+        raise Refusal(
+            RefusalCode.VIEW_INVALID,
+            f"view '{view_name}' has no cube projections",
+            f"Add a cubes entry with a join_path to view '{view_name}'.",
+        )
 
     selected = []
     paths = []
@@ -217,28 +246,46 @@ def _resolve_view(view, view_name, cubes):
     path_of = {}
     for index, raw_entry in enumerate(entries):
         if not isinstance(raw_entry, dict):
-            raise ConversionError(f"view '{view_name}': cubes[{index}] must be a mapping")
+            raise Refusal(
+                RefusalCode.VIEW_INVALID,
+                f"view '{view_name}': cubes[{index}] must be a mapping",
+                f"Write cubes[{index}] of view '{view_name}' as a mapping with a join_path.",
+            )
         entry = snake_keys(raw_entry)
         if entry.get("split"):
-            raise ConversionError(
-                f"view '{view_name}': split view projections are not supported for "
-                "publication; publish each split view explicitly"
+            raise Refusal(
+                RefusalCode.MEMBER_UNSUPPORTED,
+                f"view '{view_name}': split view projections are not supported for publication",
+                f"Publish each split view of '{view_name}' as its own view.",
             )
         join_path = entry.get("join_path")
         if not isinstance(join_path, str) or not join_path.strip():
-            raise ConversionError(f"view '{view_name}': cubes[{index}] has no non-empty join_path")
+            raise Refusal(
+                RefusalCode.VIEW_INVALID,
+                f"view '{view_name}': cubes[{index}] has no non-empty join_path",
+                f"Give cubes[{index}] of view '{view_name}' a join_path.",
+            )
         parts = join_path.split(".")
         if any(not part for part in parts):
-            raise ConversionError(f"view '{view_name}': invalid join_path '{join_path}'")
+            raise Refusal(
+                RefusalCode.VIEW_INVALID,
+                f"view '{view_name}': invalid join_path '{join_path}'",
+                f"Write join_path '{join_path}' in view '{view_name}' as cube names joined by "
+                "dots.",
+            )
         if len(set(parts)) != len(parts):
-            raise ConversionError(
-                f"view '{view_name}': cyclic join_path '{join_path}' is not publishable"
+            raise Refusal(
+                RefusalCode.VIEW_JOIN_PATH_UNSUPPORTED,
+                f"view '{view_name}': cyclic join_path '{join_path}' is not publishable",
+                f"Remove the repeated cube from join_path '{join_path}' in view '{view_name}'.",
             )
         missing = [part for part in parts if part not in cubes]
         if missing:
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.VIEW_INVALID,
                 f"view '{view_name}': join_path '{join_path}' references unknown "
-                f"cube '{missing[0]}'"
+                f"cube '{missing[0]}'",
+                f"Change '{missing[0]}' in join_path '{join_path}' to a cube the model defines.",
             )
         paths.append(parts)
         for part in parts:
@@ -247,18 +294,22 @@ def _resolve_view(view, view_name, cubes):
         leaf = parts[-1]
         prior_path = path_of.setdefault(leaf, tuple(parts))
         if prior_path != tuple(parts):
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.VIEW_JOIN_PATH_UNSUPPORTED,
                 f"view '{view_name}': cube '{leaf}' is reached through join paths "
                 f"'{'.'.join(prior_path)}' and '{join_path}'; publication would make its "
-                "member expressions ambiguous"
+                "member expressions ambiguous",
+                f"Reach cube '{leaf}' through one join_path in view '{view_name}'.",
             )
         for index, (left, right) in enumerate(zip(parts, parts[1:], strict=False)):
             prior = path_to.setdefault(right, parts[: index + 2])
             if prior[-2] != left:
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.VIEW_JOIN_PATH_UNSUPPORTED,
                     f"view '{view_name}': cube '{right}' is reached through join paths "
                     f"'{'.'.join(prior)}' and '{'.'.join(parts[: index + 2])}'; diamond "
-                    "join projections are not supported"
+                    "join projections are not supported",
+                    f"Reach cube '{right}' through one join_path in view '{view_name}'.",
                 )
             join = _find_join(cubes[left], left, right)
             joins.setdefault(left, {})[right] = join
@@ -267,12 +318,18 @@ def _resolve_view(view, view_name, cubes):
 
     roots = {path[0] for path in paths}
     if len(roots) != 1:
-        raise ConversionError(
-            f"view '{view_name}' has multiple join roots {sorted(roots)}; select a "
-            "single-root view for publication"
+        raise Refusal(
+            RefusalCode.VIEW_JOIN_PATH_UNSUPPORTED,
+            f"view '{view_name}' has multiple join roots {sorted(roots)}",
+            f"Start every join_path in view '{view_name}' at the same cube, or publish one "
+            "view per root.",
         )
     if not selected:
-        raise ConversionError(f"view '{view_name}' exposes no dimensions or measures")
+        raise Refusal(
+            RefusalCode.VIEW_INVALID,
+            f"view '{view_name}' exposes no dimensions or measures",
+            f"Include at least one dimension or measure in view '{view_name}'.",
+        )
 
     seen = {}
     deduped = []
@@ -285,11 +342,12 @@ def _resolve_view(view, view_name, cubes):
         exact.add(identity)
         if key in seen:
             other = seen[key]
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MEMBER_NAME_CONFLICT,
                 f"view '{view_name}': published name '{member.output_name}' from "
                 f"'{member.cube}.{member.source_name}' collides with "
-                f"'{other.cube}.{other.source_name}' (identifiers are "
-                "case-insensitive); use an alias or prefix"
+                f"'{other.cube}.{other.source_name}' (identifiers are case-insensitive)",
+                f"Rename one of them in view '{view_name}' with alias or prefix.",
             )
         seen[key] = member
         deduped.append(member)
@@ -303,23 +361,36 @@ def _find_join(cube, own_name, target):
         if join.get("name") == target
     ]
     if not matches:
-        raise ConversionError(
+        raise Refusal(
+            RefusalCode.VIEW_INVALID,
             f"view join_path requires '{own_name}.{target}', but cube "
-            f"'{own_name}' declares no join to '{target}'"
+            f"'{own_name}' declares no join to '{target}'",
+            f"Declare a join from cube '{own_name}' to '{target}', or change the view's "
+            "join_path.",
         )
     if len(matches) > 1:
-        raise ConversionError(f"cube '{own_name}' declares more than one join to '{target}'")
+        raise Refusal(
+            RefusalCode.MODEL_INVALID,
+            f"cube '{own_name}' declares more than one join to '{target}'",
+            f"Keep one join from cube '{own_name}' to '{target}'.",
+        )
     return matches[0]
 
 
 def _members_from_entry(view_name, entry, cube_name, cube):
     prefix = entry.get("prefix", False)
     if not isinstance(prefix, bool):
-        raise ConversionError(f"view '{view_name}': prefix for cube '{cube_name}' must be boolean")
+        raise Refusal(
+            RefusalCode.VIEW_INVALID,
+            f"view '{view_name}': prefix for cube '{cube_name}' must be boolean",
+            f"Set prefix for cube '{cube_name}' in view '{view_name}' to true or false.",
+        )
     alias = entry["alias"] if "alias" in entry else cube_name
     if not isinstance(alias, str) or not alias:
-        raise ConversionError(
-            f"view '{view_name}': alias for cube '{cube_name}' must be a non-empty string"
+        raise Refusal(
+            RefusalCode.VIEW_INVALID,
+            f"view '{view_name}': alias for cube '{cube_name}' must be a non-empty string",
+            f"Set alias for cube '{cube_name}' in view '{view_name}' to a name.",
         )
 
     collections = {
@@ -353,43 +424,57 @@ def _members_from_entry(view_name, entry, cube_name, cube):
                 source_name = include.get("name")
                 output_name = include["alias"] if "alias" in include else source_name
                 if not isinstance(source_name, str) or not source_name:
-                    raise ConversionError(
-                        f"view '{view_name}': include for cube '{cube_name}' must name a member"
+                    raise Refusal(
+                        RefusalCode.VIEW_INVALID,
+                        f"view '{view_name}': include for cube '{cube_name}' must name a member",
+                        f"Give each mapping in the includes for cube '{cube_name}' a name.",
                     )
                 if not isinstance(output_name, str) or not output_name:
-                    raise ConversionError(
+                    raise Refusal(
+                        RefusalCode.VIEW_INVALID,
                         f"view '{view_name}': alias for member '{source_name}' must be a "
-                        "non-empty string"
+                        "non-empty string",
+                        f"Set alias for member '{source_name}' in view '{view_name}' to a name.",
                     )
                 override = include
             else:
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.VIEW_INVALID,
                     f"view '{view_name}': includes for cube '{cube_name}' must "
-                    "contain strings or mappings"
+                    "contain strings or mappings",
+                    f"List member names or mappings in the includes for cube '{cube_name}'.",
                 )
             if "." in output_name or "." in source_name:
-                raise ConversionError(
-                    f"view '{view_name}': paths are not allowed in includes ('{source_name}')"
+                raise Refusal(
+                    RefusalCode.VIEW_INVALID,
+                    f"view '{view_name}': paths are not allowed in includes ('{source_name}')",
+                    f"Include '{source_name}' from a cubes entry whose join_path reaches its cube.",
                 )
             requested.append((source_name, output_name, override))
     else:
-        raise ConversionError(
-            f"view '{view_name}': includes for cube '{cube_name}' must be '*' or a list"
+        raise Refusal(
+            RefusalCode.VIEW_INVALID,
+            f"view '{view_name}': includes for cube '{cube_name}' must be '*' or a list",
+            f"Set the includes for cube '{cube_name}' in view '{view_name}' to '*' or a list.",
         )
 
     excludes = entry.get("excludes")
     if excludes is None:
         excludes = []
     if not isinstance(excludes, list) or not all(isinstance(v, str) for v in excludes):
-        raise ConversionError(
-            f"view '{view_name}': excludes for cube '{cube_name}' must be a list of member names"
+        raise Refusal(
+            RefusalCode.VIEW_INVALID,
+            f"view '{view_name}': excludes for cube '{cube_name}' must be a list of member names",
+            f"List member names in the excludes for cube '{cube_name}'.",
         )
     known_members = {name for members in collections.values() for name in members}
     unknown_excludes = [name for name in excludes if name not in known_members]
     if unknown_excludes:
-        raise ConversionError(
+        raise Refusal(
+            RefusalCode.VIEW_INVALID,
             f"view '{view_name}': excluded member '{cube_name}.{unknown_excludes[0]}' "
-            "does not exist"
+            "does not exist",
+            f"Remove '{unknown_excludes[0]}' from the excludes for cube '{cube_name}'.",
         )
     out = []
     for source_name, output_name, override in requested:
@@ -399,30 +484,38 @@ def _members_from_entry(view_name, entry, cube_name, cube):
             if source_name in members
         ]
         if not found:
-            raise ConversionError(
-                f"view '{view_name}': member '{cube_name}.{source_name}' does not exist"
+            raise Refusal(
+                RefusalCode.VIEW_INVALID,
+                f"view '{view_name}': member '{cube_name}.{source_name}' does not exist",
+                f"Remove '{source_name}' from the includes for cube '{cube_name}', or define it "
+                "in that cube.",
             )
         if source_name in excludes:
             continue
         kind, definition = found[0]
         if kind == "measure" and _is_generated_part(definition):
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MEMBER_UNSUPPORTED,
                 f"view '{view_name}': measure '{cube_name}.{source_name}' is an internal "
-                "Ossie-generated aggregate helper and cannot be published directly"
+                "Ossie-generated aggregate helper and cannot be published directly",
+                leave_out(f"measure '{cube_name}.{source_name}'"),
             )
         if kind in ("segment", "hierarchy"):
-            raise ConversionError(
-                f"view '{view_name}': selected {kind} "
-                f"'{cube_name}.{source_name}' has no Databricks Metric View "
-                "equivalent; exclude it from the published view"
+            raise Refusal(
+                RefusalCode.MEMBER_UNSUPPORTED,
+                f"view '{view_name}': selected {kind} '{cube_name}.{source_name}' has no "
+                "Databricks Metric View equivalent",
+                leave_out(f"{kind} '{cube_name}.{source_name}'"),
             )
         dtype = str(definition.get("type") or "").lower()
         if kind == "dimension" and (dtype in ("geo", "switch") or definition.get("sub_query")):
             feature = "sub_query" if definition.get("sub_query") else dtype
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MEMBER_UNSUPPORTED,
                 f"view '{view_name}': selected dimension "
                 f"'{cube_name}.{source_name}' uses {feature}, which has no safe "
-                "publication form"
+                "publication form",
+                leave_out(f"dimension '{cube_name}.{source_name}'"),
             )
         final_name = f"{alias}_{output_name}" if prefix else output_name
         out.append(_SelectedMember(cube_name, source_name, final_name, kind, override))
@@ -433,10 +526,16 @@ def _resolve_source(view_name, requested, default, required):
     if requested is None:
         return default
     if not isinstance(requested, str) or not requested:
-        raise ConversionError(f"view '{view_name}': source must be a dataset name")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            f"view '{view_name}': source must be a dataset name",
+            REPORT_FIX,
+        )
     if requested not in required:
-        raise ConversionError(
-            f"view '{view_name}': source '{requested}' is not in the projected datasets {required}"
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            f"view '{view_name}': source '{requested}' is not in the projected datasets {required}",
+            REPORT_FIX,
         )
     return requested
 
@@ -492,9 +591,11 @@ def _inline_cube_sql(sql, cubes, stack):
 
         result = _CUBE_SQL_CALL_RE.sub(expand, sql)
     if left := _CUBE_SQL_ANY_CALL_RE.search(result):
-        raise ConversionError(
-            f"cube '{stack[-1]}' reads '{left.group(0)}', which names a join path; "
-            "reference the cube itself, as in '{other_cube.sql()}'"
+        raise Refusal(
+            RefusalCode.SOURCE_UNSUPPORTED,
+            f"cube '{stack[-1]}' reads '{left.group(0)}', which names a join path",
+            f"Reference that cube directly in cube '{stack[-1]}', as in "
+            "'{other_cube.sql()}'.",
         )
     return result
 
@@ -508,11 +609,17 @@ def _referenced_cube_sql(target, cubes, stack):
         target = referrer
     if target in stack:
         chain = " -> ".join((*stack, target))
-        raise ConversionError(f"cube '{referrer}' reads {reference} in a cycle: {chain}")
+        raise Refusal(
+            RefusalCode.MODEL_INVALID,
+            f"cube '{referrer}' reads {reference} in a cycle: {chain}",
+            f"Remove one of the sql() references in {chain}.",
+        )
     cube = cubes.get(target)
     if cube is None:
-        raise ConversionError(
-            f"cube '{referrer}' reads {reference}, but cube '{target}' is not in the model"
+        raise Refusal(
+            RefusalCode.MODEL_INVALID,
+            f"cube '{referrer}' reads {reference}, but cube '{target}' is not in the model",
+            f"Define cube '{target}', or remove {reference} from cube '{referrer}'.",
         )
 
     if isinstance(cube.get("sql_table"), str):
@@ -522,13 +629,21 @@ def _referenced_cube_sql(target, cubes, stack):
         text = _inline_cube_sql(cube["sql"], cubes, (*stack, target))
         is_table = False
     else:
-        raise ConversionError(f"cube '{referrer}' reads {reference}, but '{target}' has no SQL")
+        raise Refusal(
+            RefusalCode.SOURCE_UNSUPPORTED,
+            f"cube '{referrer}' reads {reference}, but '{target}' has no SQL",
+            f"Give cube '{target}' a sql or sql_table, or stop reading it from cube "
+            f"'{referrer}'.",
+        )
     # Cube resolves the rest of the referenced SQL ({CUBE}, members, context) as that
     # cube; inlined into another cube's source, the same text would mean something else.
     if leftover := _CUBE_REF_RE.search(_ESCAPED_BRACE_RE.sub("", text)):
-        raise ConversionError(
+        raise Refusal(
+            RefusalCode.SOURCE_UNSUPPORTED,
             f"cube '{referrer}' reads {reference}, whose SQL uses '{leftover.group(0)}', "
-            "which only Cube can resolve"
+            "which only Cube can resolve",
+            f"Replace '{leftover.group(0)}' in cube '{target}' with SQL Databricks can run "
+            "on its own.",
         )
     return text, is_table
 
@@ -627,21 +742,29 @@ def _expand_dependency_graph(
             continue
         paths = _declared_join_paths(cubes, root, target)
         if not paths:
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.VIEW_JOIN_PATH_UNSUPPORTED,
                 f"view '{view_name}': selected members depend on cube '{target}', "
-                f"but it has no declared join path from view root '{root}'"
+                f"but it has no declared join path from view root '{root}'",
+                f"Declare a join that reaches cube '{target}' from '{root}', or leave the "
+                f"members that read it out of view '{view_name}'.",
             )
         if len(paths) > 1:
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.VIEW_JOIN_PATH_UNSUPPORTED,
                 f"view '{view_name}': selected members depend on cube '{target}' through "
-                "multiple declared join paths; add an explicit view join_path to disambiguate it"
+                "multiple declared join paths",
+                f"Add a cubes entry with an explicit join_path to cube '{target}' in view "
+                f"'{view_name}'.",
             )
         for left, right in zip(paths[0], paths[0][1:], strict=False):
             prior_parent = parent_of.setdefault(right, left)
             if prior_parent != left:
-                raise ConversionError(
-                    f"view '{view_name}': dependency cube '{right}' would have multiple "
-                    "parents; add an explicit view join_path to disambiguate it"
+                raise Refusal(
+                    RefusalCode.VIEW_JOIN_PATH_UNSUPPORTED,
+                    f"view '{view_name}': dependency cube '{right}' would have multiple parents",
+                    f"Add a cubes entry with an explicit join_path to cube '{right}' in view "
+                    f"'{view_name}'.",
                 )
             expanded_joins.setdefault(left, {})[right] = _find_join(cubes[left], left, right)
             if right not in expanded_required:
@@ -660,10 +783,13 @@ def _expand_dependency_graph(
                 if path[-1] in expanded_required
                 else ""
             )
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.VIEW_JOIN_PATH_UNSUPPORTED,
                 f"view '{view_name}': selected members read cube '{path[-1]}' through join "
                 f"path '{'.'.join(path)}', which the view's joins do not follow{other}; a "
-                "Metric View joins each cube along one path"
+                "Metric View joins each cube along one path",
+                f"Make those members read cube '{path[-1]}' through the view's own join_path, "
+                f"or leave them out of view '{view_name}'.",
             )
     return expanded_required, expanded_joins
 
@@ -808,13 +934,16 @@ def _declared_join_paths(cubes, start, target):
     return [first]
 
 
-class _NoPublicationForm(ConversionError):
+class _NoPublicationForm(Refusal):
     """The first measure a closure reaches that no Metric View can compute."""
 
     def __init__(self, measure, feature):
         super().__init__(
+            RefusalCode.MEMBER_UNSUPPORTED,
             f"measure '{measure[0]}.{measure[1]}' {feature} with no faithful Databricks Metric "
-            "View publication form"
+            "View publication form",
+            f"Leave measure '{measure[0]}.{measure[1]}', and every selected measure that "
+            "references it, out of the view.",
         )
         self.measure = measure
         self.feature = feature
@@ -835,12 +964,37 @@ def _unpublishable_measures(cubes, selected):
         except _NoPublicationForm as refusal:
             root = refusal.measure
             parked[key] = (
-                str(refusal)
+                refusal.reason
                 if root == key
                 else f"measure '{key[0]}.{key[1]}' depends on measure '{root[0]}.{root[1]}', "
                 f"which {refusal.feature} with no faithful Databricks Metric View publication form"
             )
     return parked
+
+
+def _refuse_custom_granularities(view_name, cubes, selected):
+    """Refuse a selected custom granularity by name.
+
+    Ossie keeps it in a Cube extension, which the Databricks converter only reports
+    as a dropped foreign-vendor extension.
+    """
+    for member in selected:
+        if member.kind != "dimension":
+            continue
+        dimensions = _as_named_list(
+            cubes[member.cube].get("dimensions"), f"cube '{member.cube}' dimensions"
+        )
+        definition = next(
+            (item for item in dimensions if item.get("name") == member.source_name), {}
+        )
+        if definition.get("granularities"):
+            raise Refusal(
+                RefusalCode.MEMBER_UNSUPPORTED,
+                f"view '{view_name}': selected dimension '{member.cube}.{member.source_name}' "
+                "defines custom granularities, which a Metric View dimension cannot carry",
+                "Include a dimension with the same sql and no granularities in view "
+                f"'{view_name}' instead of '{member.cube}.{member.source_name}'.",
+            )
 
 
 def _excluding(view, measures):
@@ -893,9 +1047,11 @@ def _active_multi_stage_properties(measure, cube_name, measure_name):
     if "multi_stage" in measure:
         value = measure["multi_stage"]
         if not isinstance(value, bool):
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MODEL_INVALID,
                 f"measure '{cube_name}.{measure_name}' has malformed multi_stage; "
-                "expected a boolean"
+                "expected a boolean",
+                f"Set multi_stage on measure '{cube_name}.{measure_name}' to true or false.",
             )
         if value:
             active.append("multi_stage")
@@ -905,9 +1061,11 @@ def _active_multi_stage_properties(measure, cube_name, measure_name):
             continue
         value = measure[property_name]
         if not isinstance(value, list):
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MODEL_INVALID,
                 f"measure '{cube_name}.{measure_name}' has malformed {property_name}; "
-                "expected a list"
+                "expected a list",
+                f"Write {property_name} on measure '{cube_name}.{measure_name}' as a list.",
             )
         if value:
             active.append(property_name)
@@ -915,8 +1073,10 @@ def _active_multi_stage_properties(measure, cube_name, measure_name):
     if "grain" in measure:
         value = measure["grain"]
         if not isinstance(value, dict):
-            raise ConversionError(
-                f"measure '{cube_name}.{measure_name}' has malformed grain; expected a mapping"
+            raise Refusal(
+                RefusalCode.MODEL_INVALID,
+                f"measure '{cube_name}.{measure_name}' has malformed grain; expected a mapping",
+                f"Write grain on measure '{cube_name}.{measure_name}' as a mapping.",
             )
         if value:
             active.append("grain")
@@ -975,10 +1135,12 @@ def _dimension_dependency_closure(cubes, needed_measures, initial_dimensions):
                 if kind == "dataset":
                     raw_dependency_cubes.add(target)
                 elif target in measures:
-                    raise ConversionError(
+                    raise Refusal(
+                        RefusalCode.MEMBER_UNSUPPORTED,
                         f"dimension '{cube_name}.{dimension_name}' references measure "
                         f"'{target[0]}.{target[1]}'; correlated/sub-query dimensions "
-                        "cannot be published safely"
+                        "cannot be published safely",
+                        leave_out(f"dimension '{cube_name}.{dimension_name}'"),
                     )
                 elif target in dimensions and target not in needed:
                     needed.add(target)
@@ -1174,14 +1336,19 @@ def _cube_references(text, own_cube, cubes):
             else (own_cube if head in ("CUBE", "TABLE", own_cube) else head, rest)
         )
         if dot and target[0] not in cubes:
-            raise ConversionError(
-                f"reference '{{{body}}}' uses unknown cube qualifier '{head}'; "
-                "use '{cube}.column' for a raw joined-cube column"
+            raise Refusal(
+                RefusalCode.MODEL_INVALID,
+                f"reference '{{{body}}}' uses unknown cube qualifier '{head}'",
+                f"Correct '{head}' to a cube name, or write a raw joined-cube column as "
+                "'{cube}.column'.",
             )
         if not _cube_has_member(cubes[target[0]], target[0], target[1]):
-            raise ConversionError(
-                f"reference '{{{body}}}' does not match a dimension or measure in "
-                f"cube '{target[0]}'; use '{{{target[0]}}}.{target[1]}' for a raw column"
+            raise Refusal(
+                RefusalCode.MODEL_INVALID,
+                f"reference '{{{body}}}' does not match a dimension or measure in cube "
+                f"'{target[0]}'",
+                f"Correct it to a member of cube '{target[0]}', or write a raw column as "
+                f"'{{{target[0]}}}.{target[1]}'.",
             )
         yield "member", target
 
@@ -1222,9 +1389,11 @@ def _replace_raw_dataset_aliases(sql, own_cube, markers, *, reject_cross, scope)
         ):
             return match.group(0)
         if reject_cross:
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MEMBER_SQL_UNSUPPORTED,
                 f"dimension '{scope}' reads raw joined-cube columns from '{dataset}'; "
-                "a dataset-scoped Ossie field cannot preserve that join"
+                "a dataset-scoped Ossie field cannot preserve that join",
+                f"Define dimension '{scope}' in cube '{dataset}', or leave it out of the view.",
             )
         return markers[dataset]
 
@@ -1250,9 +1419,11 @@ def _qualify_physical_columns(
             or (not subqueries and tree.find(exp.Query) is not None)
             or any(token.token_type is TokenType.ARROW for token in tokens)
         ):
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MEMBER_SQL_UNSUPPORTED,
                 f"{scope} contains nested SQL bindings that cannot be safely "
-                "attributed to Cube datasets"
+                "attributed to Cube datasets",
+                f"Rewrite the SQL of {scope} without nested SQL references.",
             )
         edits = []
         for column in tree.find_all(exp.Column):
@@ -1260,28 +1431,35 @@ def _qualify_physical_columns(
                 continue
             _, parts = _complete_column_path(column)
             if not parts:
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
                     f"{scope} contains a column path whose Cube dataset provenance "
-                    "cannot be determined"
+                    "cannot be determined",
+                    f"Write each column in {scope} as {{cube}}.column.",
                 )
             if parts[0].name.casefold() in known_qualifiers:
                 continue
             if bare_only and len(parts) > 1:
                 path = ".".join(part.name for part in parts)
-                raise ConversionError(
-                    f"{scope} reads '{path}', which is not a column of a cube it can "
-                    "reach; reference columns as '{cube}.column'"
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                    f"{scope} reads '{path}', which is not a column of a cube it can reach",
+                    f"Write '{path}' in {scope} as '{{cube}}.column' for a cube the view reaches.",
                 )
             start = parts[0].meta.get("start")
             if not isinstance(start, int):
-                raise ConversionError(
-                    f"{scope} contains a column whose source position cannot be determined"
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                    f"{scope} contains a column whose source position cannot be determined",
+                    f"Write each column in {scope} as {{cube}}.column.",
                 )
             edits.append((start, start, f"{qualifier}."))
         return _apply_text_edits(expression, edits)
     except SqlglotError as error:
-        raise ConversionError(
-            f"{scope} is not safely parseable for Cube dataset provenance: {error}"
+        raise Refusal(
+            RefusalCode.MEMBER_SQL_UNSUPPORTED,
+            f"{scope} is not safely parseable for Cube dataset provenance: {error}",
+            f"Rewrite the SQL of {scope} in syntax Databricks can parse.",
         ) from error
 
 
@@ -1403,15 +1581,21 @@ class _DimensionResolver:
                 not dot and _cube_has_member(self._cubes[own_cube], own_cube, head)
             ):
                 continue
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.VIEW_JOIN_NOT_REPRESENTABLE,
                 f"{scope} reads cube '{head}'; a Databricks Metric View join condition "
-                "can read only the two cubes it joins"
+                "can read only the two cubes it joins",
+                f"Rewrite {scope} to read only those two cubes, or leave the joined cube out of "
+                "the view.",
             )
         for kind, reference in _cube_references(sql, own_cube, self._cubes):
             if kind == "member" and reference in self._measures:
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.VIEW_JOIN_NOT_REPRESENTABLE,
                     f"{scope} references measure '{reference[0]}.{reference[1]}'; a join "
-                    "condition can read only columns and dimensions"
+                    "condition can read only columns and dimensions",
+                    f"Rewrite {scope} with columns or dimensions instead of measure "
+                    f"'{reference[0]}.{reference[1]}'.",
                 )
 
         # Columns are qualified with sqlglot rather than qualify_bare_columns, which
@@ -1456,9 +1640,12 @@ class _DimensionResolver:
         # A Metric View join keeps one match per row, so a condition such as
         # '1 = 1' would keep one row where Cube keeps every row it matches.
         if self._dataset_markers[target] not in condition:
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.VIEW_JOIN_NOT_REPRESENTABLE,
                 f"{scope} reads no column of '{target}'; a Databricks Metric View join keeps "
-                "one match per row, where Cube keeps every row this condition matches"
+                "one match per row, where Cube keeps every row this condition matches",
+                f"Add a condition on a column of '{target}' to {scope}, or leave '{target}' "
+                "out of the view.",
             )
         return condition
 
@@ -1469,12 +1656,18 @@ class _DimensionResolver:
         marker = (cube_name, member_name)
         if marker in stack:
             chain = " -> ".join(f"{c}.{m}" for c, m in stack + (marker,))
-            raise ConversionError(f"dimension reference cycle: {chain}")
+            raise Refusal(
+                RefusalCode.MODEL_INVALID,
+                f"dimension reference cycle: {chain}",
+                f"Remove one of the references in {chain}.",
+            )
         dim = self._dimensions[marker]
         dtype = str(dim.get("type") or "string").lower()
         if dtype in ("geo", "switch") or dim.get("sub_query"):
-            raise ConversionError(
-                f"dimension '{cube_name}.{member_name}' has no safe static publication expression"
+            raise Refusal(
+                RefusalCode.MEMBER_UNSUPPORTED,
+                f"dimension '{cube_name}.{member_name}' has no safe static publication expression",
+                leave_out(f"dimension '{cube_name}.{member_name}'"),
             )
         if dim.get("case") is not None:
             expr = self._case_expression(
@@ -1524,38 +1717,51 @@ class _DimensionResolver:
                 rest,
             )
         if target in self._measures:
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MEMBER_UNSUPPORTED,
                 f"dimension '{stack[0][0]}.{stack[0][1]}' references measure "
                 f"'{target[0]}.{target[1]}'; correlated/sub-query dimensions "
-                "cannot be published safely"
+                "cannot be published safely",
+                leave_out(f"dimension '{stack[0][0]}.{stack[0][1]}'"),
             )
         if target not in self._dimensions:
             return None
         if not qualified and target[0] != own_cube:
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MEMBER_SQL_UNSUPPORTED,
                 f"dimension '{stack[0][0]}.{stack[0][1]}' reads joined-cube "
                 f"dimension '{target[0]}.{target[1]}'; a dataset-scoped Ossie "
-                "field cannot preserve that join"
+                "field cannot preserve that join",
+                f"Define dimension '{stack[0][0]}.{stack[0][1]}' in cube '{target[0]}', or "
+                f"include '{target[0]}.{target[1]}' in the view directly.",
             )
         inner = self.expression(target[0], target[1], qualified, stack)
         return f"({inner})" if has_top_level_operator(inner) else inner
 
     def _case_expression(self, cube_name, member_name, case, qualified, stack):
         if not isinstance(case, dict):
-            raise ConversionError(f"dimension '{cube_name}.{member_name}' has a non-mapping case")
+            raise Refusal(
+                RefusalCode.MODEL_INVALID,
+                f"dimension '{cube_name}.{member_name}' has a non-mapping case",
+                f"Write case on dimension '{cube_name}.{member_name}' as a mapping.",
+            )
         parts = []
         for branch in case.get("when") or []:
             if not isinstance(branch, dict) or branch.get("sql") is None:
-                raise ConversionError(
-                    f"dimension '{cube_name}.{member_name}' has an invalid case.when entry"
+                raise Refusal(
+                    RefusalCode.MODEL_INVALID,
+                    f"dimension '{cube_name}.{member_name}' has an invalid case.when entry",
+                    f"Give each case.when entry on dimension '{cube_name}.{member_name}' a sql.",
                 )
             condition = self._translate(branch["sql"], cube_name, qualified, stack)
             parts.append(
                 f"WHEN {condition} THEN {self._case_label(branch, cube_name, qualified, stack)}"
             )
         if not parts:
-            raise ConversionError(
-                f"dimension '{cube_name}.{member_name}' has no case.when branches"
+            raise Refusal(
+                RefusalCode.MODEL_INVALID,
+                f"dimension '{cube_name}.{member_name}' has no case.when branches",
+                f"Add a case.when branch to dimension '{cube_name}.{member_name}'.",
             )
         otherwise = case.get("else")
         if isinstance(otherwise, dict) and "label" in otherwise:
@@ -1566,7 +1772,11 @@ class _DimensionResolver:
         label = holder.get("label")
         if isinstance(label, dict):
             if label.get("sql") is None:
-                raise ConversionError("case label object has no sql")
+                raise Refusal(
+                    RefusalCode.MODEL_INVALID,
+                    "case label object has no sql",
+                    "Give the case label a sql.",
+                )
             return self._translate(label["sql"], cube_name, qualified, stack)
         return "'" + str(label if label is not None else "").replace("'", "''") + "'"
 
@@ -1594,7 +1804,11 @@ class _PublicationMeasureResolver(_MeasureResolver):
                 return cache[key]
             if key in stack:
                 chain = " -> ".join(f"{c}.{m}" for c, m in stack + (key,))
-                raise ConversionError(f"measure reference cycle: {chain}")
+                raise Refusal(
+                    RefusalCode.MODEL_INVALID,
+                    f"measure reference cycle: {chain}",
+                    f"Remove one of the references in {chain}.",
+                )
             filters = [
                 self._translate(item["sql"], cname, stack + (key,), inline_refs)
                 for item in measure.get("filters") or []
@@ -1607,10 +1821,12 @@ class _PublicationMeasureResolver(_MeasureResolver):
     def _primary_key_count_expression(self, cube_name, filters):
         primary_keys = self._publication_primary_keys.get(cube_name) or []
         if not primary_keys:
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.PRIMARY_KEY_REQUIRED,
                 f"Cube '{cube_name}': a bare `type: count` measure needs the cube's "
                 "primary key to convert safely, but no dimension declares "
-                "`primary_key: true`"
+                "`primary_key: true`",
+                f"Mark the key dimension of cube '{cube_name}' with primary_key: true.",
             )
         resolved = [
             self._dimensions.expression(cube_name, primary_key, qualified=True)
@@ -1639,9 +1855,12 @@ class _PublicationMeasureResolver(_MeasureResolver):
         scope = f"measure '{cname}.{stack[0][1] if stack else '<unknown>'}'"
         for target in map(target_of, _references_inside_subqueries(sql)):
             if target is not None and self.is_measure(*target):
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
                     f"{scope} reads measure '{target[0]}.{target[1]}' inside a subquery, "
-                    "which has no Metric View form"
+                    "which has no Metric View form",
+                    f"Read dimensions or columns inside that subquery in {scope}, or leave it out "
+                    "of the view.",
                 )
             # Cube pastes a dimension's SQL into the subquery as written, so its bare
             # columns bind to the subquery's own table, which the Metric View cannot match.
@@ -1650,10 +1869,11 @@ class _PublicationMeasureResolver(_MeasureResolver):
                 and self._dimensions.has_dimension(*target)
                 and self._dimensions.has_bare_column(*target)
             ):
-                raise ConversionError(
-                    f"{scope} reads dimension '{target[0]}.{target[1]}' inside a subquery, "
-                    "and its SQL has a bare column that Cube binds to the subquery's own "
-                    "table; write the column as {CUBE}.column in that dimension"
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                    f"{scope} reads dimension '{target[0]}.{target[1]}' inside a subquery, and its "
+                    "SQL has a bare column that Cube binds to the subquery's own table",
+                    f"Write that column as {{CUBE}}.column in dimension '{target[0]}.{target[1]}'.",
                 )
 
         def resolve(body):
@@ -1671,10 +1891,13 @@ class _PublicationMeasureResolver(_MeasureResolver):
                 )
             ):
                 # SQL cannot nest aggregates; Cube plans this as a subquery instead.
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
                     f"measure '{stack[-1][0]}.{stack[-1][1]}' aggregates measure "
-                    f"'{target[0]}.{target[1]}'; an aggregate of an aggregate has no "
-                    "Metric View form, so reference a dimension instead"
+                    f"'{target[0]}.{target[1]}'; an aggregate of an aggregate has no Metric "
+                    "View form",
+                    f"Make measure '{stack[-1][0]}.{stack[-1][1]}' aggregate a dimension or "
+                    f"column instead of measure '{target[0]}.{target[1]}'.",
                 )
             return super(_PublicationMeasureResolver, self)._resolve(
                 body,
@@ -1740,9 +1963,11 @@ def _apply_projection(model, cubes, selected, carriers, metric_view):
         if member.kind == "dimension":
             fields = {field["name"]: field for field in datasets[member.cube].get("fields") or []}
             if member.source_name not in fields:
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.MEMBER_UNSUPPORTED,
                     f"selected dimension '{member.cube}.{member.source_name}' "
-                    "has no Ossie field representation"
+                    "has no Ossie field representation",
+                    leave_out(f"dimension '{member.cube}.{member.source_name}'"),
                 )
             item = copy.deepcopy(fields[member.source_name])
             item["name"] = member.output_name
@@ -1765,9 +1990,11 @@ def _apply_projection(model, cubes, selected, carriers, metric_view):
         else:
             key = (member.cube, member.source_name)
             if not converts.get(key):
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.MEMBER_UNSUPPORTED,
                     f"selected measure '{member.cube}.{member.source_name}' has "
-                    "no static Ossie expression"
+                    "no static Ossie expression",
+                    leave_out(f"measure '{member.cube}.{member.source_name}'"),
                 )
             source_metric_name = (
                 member.source_name
@@ -1775,9 +2002,11 @@ def _apply_projection(model, cubes, selected, carriers, metric_view):
                 else f"{member.cube}__{member.source_name}"
             )
             if source_metric_name not in metrics:
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.MEMBER_UNSUPPORTED,
                     f"selected measure '{member.cube}.{member.source_name}' "
-                    "was not converted to an Ossie metric"
+                    "was not converted to an Ossie metric",
+                    leave_out(f"measure '{member.cube}.{member.source_name}'"),
                 )
             item = copy.deepcopy(metrics[source_metric_name])
             item["name"] = member.output_name
@@ -1814,8 +2043,10 @@ def _apply_projection(model, cubes, selected, carriers, metric_view):
     for cube_name, cube in cubes.items():
         data_source = cube.get("data_source", "default")
         if not isinstance(data_source, str) or not data_source.strip():
-            raise ConversionError(
-                f"cube '{cube_name}': data_source must be a non-empty string when provided"
+            raise Refusal(
+                RefusalCode.MODEL_INVALID,
+                f"cube '{cube_name}': data_source must be a non-empty string when provided",
+                f"Set data_source on cube '{cube_name}' to a data source name, or remove it.",
             )
         dataset_data_sources[cube_name] = data_source
 

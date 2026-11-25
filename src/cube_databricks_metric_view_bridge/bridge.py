@@ -15,13 +15,13 @@ from typing import Literal
 
 import yaml
 from ossie import OSIDocument
-from ossie_cube import ConversionError
 from ossie_databricks._common import dump_yaml as dump_databricks_yaml
 from ossie_databricks._common import load_yaml as load_databricks_yaml
 from sqlglot import Dialect, exp, parse_one
 from sqlglot.errors import SqlglotError
 from sqlglot.tokens import TokenType
 
+from .refusal import REPORT_FIX, Refusal, RefusalCode, leave_out
 from .view_projection import _convert_cube_view_to_ossie_with_provenance
 
 
@@ -167,8 +167,13 @@ def convert_cube_view_to_databricks_metric_view(
         message for message in unhandled_warnings if _JOINED_COMPLEX_WARNING.fullmatch(message)
     ]
     if unsafe_dimensions:
-        raise ConversionError(
-            f"{unsafe_dimensions[0]}; refusing to return a publishable Metric View artifact"
+        field = _JOINED_COMPLEX_WARNING.fullmatch(unsafe_dimensions[0]).group(1)
+        raise Refusal(
+            RefusalCode.MEMBER_SQL_UNSUPPORTED,
+            f"dimension '{field}' reads a joined cube in an expression whose columns the "
+            "bridge cannot qualify safely",
+            f"Write each column in dimension '{field}' as {{CUBE}}.column or "
+            "{cube}.column, or leave the dimension out of the view.",
         )
     qualified_datasets = {
         item.dataset for item in dataset_sources if item.original_source != item.resolved_source
@@ -216,7 +221,11 @@ def _resolve_dataset_sources(
     if expected_data_source is not None and (
         not isinstance(expected_data_source, str) or not expected_data_source.strip()
     ):
-        raise ConversionError("expected_data_source must be a non-empty string when provided")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            "expected_data_source must be a non-empty string when provided",
+            REPORT_FIX,
+        )
 
     model = document["semantic_model"][0]
     resolutions = []
@@ -224,16 +233,27 @@ def _resolve_dataset_sources(
         dataset_name = dataset.get("name")
         data_source = data_sources.get(dataset_name)
         if not isinstance(dataset_name, str) or not isinstance(data_source, str):
-            raise ConversionError("projected dataset provenance is incomplete")
+            raise Refusal(
+                RefusalCode.VIEW_PROJECTION_FAILED,
+                "projected dataset provenance is incomplete",
+                REPORT_FIX,
+            )
         if expected_data_source is not None and data_source != expected_data_source:
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.DATA_SOURCE_MISMATCH,
                 f"dataset '{dataset_name}' uses Cube data source '{data_source}', "
-                f"but publication requested data source '{expected_data_source}'"
+                f"but publication requested data source '{expected_data_source}'",
+                f"Set data_source: {expected_data_source} on cube '{dataset_name}', or publish "
+                f"the view from data source '{data_source}'.",
             )
 
         original_source = dataset.get("source")
         if not isinstance(original_source, str) or not original_source.strip():
-            raise ConversionError(f"Dataset '{dataset_name}': missing/empty 'source'")
+            raise Refusal(
+                RefusalCode.SOURCE_UNSUPPORTED,
+                f"Dataset '{dataset_name}': missing/empty 'source'",
+                f"Give cube '{dataset_name}' a sql_table or a sql.",
+            )
         original_source = original_source.strip()
         resolved_source = _qualify_table_source(
             original_source,
@@ -268,9 +288,12 @@ def _qualify_table_source(
         tokens = Dialect.get_or_raise("databricks").tokenize(source)
         table = parse_one(source, read="databricks", into=exp.Table)
     except SqlglotError as error:
-        raise ConversionError(
+        raise Refusal(
+            RefusalCode.SOURCE_UNSUPPORTED,
             f"Dataset '{dataset_name}': source '{source}' is neither a static Databricks "
-            "table identifier nor a SELECT/WITH subquery"
+            "table identifier nor a SELECT/WITH subquery",
+            f"Set sql_table on cube '{dataset_name}' to catalog.schema.table, or write its "
+            "sql as a plain SELECT.",
         ) from error
 
     if (
@@ -282,34 +305,43 @@ def _qualify_table_source(
             for left, right in zip(tokens, tokens[1:], strict=False)
         )
     ):
-        raise ConversionError(
-            f"Dataset '{dataset_name}': source '{source}' contains an empty identifier part"
+        raise Refusal(
+            RefusalCode.SOURCE_UNSUPPORTED,
+            f"Dataset '{dataset_name}': source '{source}' contains an empty identifier part",
+            f"Write sql_table on cube '{dataset_name}' as catalog.schema.table.",
         )
 
     parts = list(table.parts)
     if not 1 <= len(parts) <= 3 or not all(isinstance(part, exp.Identifier) for part in parts):
-        raise ConversionError(
+        raise Refusal(
+            RefusalCode.SOURCE_UNSUPPORTED,
             f"Dataset '{dataset_name}': source '{source}' must contain one to three "
-            "Databricks identifier parts"
+            "Databricks identifier parts",
+            f"Write sql_table on cube '{dataset_name}' as catalog.schema.table.",
         )
     if not all(part.name.strip() for part in parts):
-        raise ConversionError(
-            f"Dataset '{dataset_name}': source '{source}' contains an empty identifier part"
+        raise Refusal(
+            RefusalCode.SOURCE_UNSUPPORTED,
+            f"Dataset '{dataset_name}': source '{source}' contains an empty identifier part",
+            f"Write sql_table on cube '{dataset_name}' as catalog.schema.table.",
         )
 
     if len(parts) < 3:
         catalog = _parse_default_identifier(default_catalog, "default_catalog", dataset_name)
         if catalog is None:
-            raise ConversionError(
-                f"Dataset '{dataset_name}': source '{source}' is not catalog-qualified; "
-                "provide default_catalog from the selected Databricks data source"
+            raise Refusal(
+                RefusalCode.SOURCE_UNSUPPORTED,
+                f"Dataset '{dataset_name}': source '{source}' is not catalog-qualified",
+                f"Write sql_table on cube '{dataset_name}' as catalog.schema.table, or set a "
+                "default catalog for its Databricks data source.",
             )
         if len(parts) == 1:
             schema = _parse_default_identifier(default_schema, "default_schema", dataset_name)
             if schema is None:
-                raise ConversionError(
-                    f"Dataset '{dataset_name}': source '{source}' has no schema; provide "
-                    "default_schema together with default_catalog"
+                raise Refusal(
+                    RefusalCode.SOURCE_UNSUPPORTED,
+                    f"Dataset '{dataset_name}': source '{source}' has no schema",
+                    f"Write sql_table on cube '{dataset_name}' as catalog.schema.table.",
                 )
             parts = [catalog, schema, *parts]
         else:
@@ -355,7 +387,11 @@ def _apply_join_conditions(
         return metric_view_yaml
     metric_view = load_databricks_yaml(metric_view_yaml)
     if not isinstance(metric_view, dict):
-        raise ConversionError("Databricks converter returned a non-mapping Metric View")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            "Databricks converter returned a non-mapping Metric View",
+            REPORT_FIX,
+        )
     pending = set(join_conditions)
 
     def visit(joins, parent_alias, parent_dataset):
@@ -369,9 +405,11 @@ def _apply_join_conditions(
                 own, target, template = join_conditions[carrier]
                 aliases = {parent_dataset: (parent_alias,), dataset: (join["name"],)}
                 if {own, target} != set(aliases):
-                    raise ConversionError(
+                    raise Refusal(
+                        RefusalCode.VIEW_PROJECTION_FAILED,
                         f"join '{own}' -> '{target}' was emitted between other datasets; "
-                        "refusing publication"
+                        "refusing publication",
+                        REPORT_FIX,
                     )
                 condition = _render_metric_template(
                     template,
@@ -391,9 +429,13 @@ def _apply_join_conditions(
 
     visit(metric_view.get("joins"), "source", source_datasets.get(metric_view.get("source")))
     if pending:
-        raise ConversionError(
-            "Databricks converter dropped a join whose Cube condition it cannot express; "
-            "refusing publication"
+        own, target, _ = join_conditions[min(pending)]
+        raise Refusal(
+            RefusalCode.VIEW_JOIN_NOT_REPRESENTABLE,
+            f"Databricks converter dropped the join '{own}' -> '{target}', whose Cube "
+            "condition it cannot express",
+            f"Rewrite the sql of the join from '{own}' to '{target}' as a condition on columns "
+            f"of the two cubes, or leave '{target}' out of the view.",
         )
     return dump_databricks_yaml(metric_view)
 
@@ -403,7 +445,11 @@ def _restore_converter_sources(metric_view_yaml: str, replacements: dict[str, st
 
     metric_view = load_databricks_yaml(metric_view_yaml)
     if not isinstance(metric_view, dict):
-        raise ConversionError("Databricks converter returned a non-mapping Metric View")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            "Databricks converter returned a non-mapping Metric View",
+            REPORT_FIX,
+        )
 
     restored = set()
 
@@ -422,8 +468,10 @@ def _restore_converter_sources(metric_view_yaml: str, replacements: dict[str, st
     restore(metric_view)
     remaining = set(replacements) - restored
     if remaining:
-        raise ConversionError(
-            "Databricks converter did not preserve every projected dataset source"
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            "Databricks converter did not preserve every projected dataset source",
+            REPORT_FIX,
         )
     return dump_databricks_yaml(metric_view)
 
@@ -432,18 +480,28 @@ def _parse_default_identifier(value, option, dataset_name):
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
-        raise ConversionError(f"{option} must be a non-empty Databricks identifier when provided")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            f"{option} must be a non-empty Databricks identifier when provided",
+            REPORT_FIX,
+        )
     try:
         table = parse_one(value.strip(), read="databricks", into=exp.Table)
     except SqlglotError as error:
-        raise ConversionError(
-            f"Dataset '{dataset_name}': {option} '{value}' is not a valid Databricks identifier"
+        raise Refusal(
+            RefusalCode.SOURCE_UNSUPPORTED,
+            f"Dataset '{dataset_name}': {option} '{value}' is not a valid Databricks identifier",
+            f"Set {option} to one Databricks identifier, or write sql_table on cube "
+            f"'{dataset_name}' as catalog.schema.table.",
         ) from error
     parts = list(table.parts)
     if len(parts) != 1 or not isinstance(parts[0], exp.Identifier) or not parts[0].name.strip():
-        raise ConversionError(
+        raise Refusal(
+            RefusalCode.SOURCE_UNSUPPORTED,
             f"Dataset '{dataset_name}': {option} '{value}' must be exactly one identifier; "
-            "quote dots that are part of its name"
+            "quote dots that are part of its name",
+            f"Set {option} to one Databricks identifier, or write sql_table on cube "
+            f"'{dataset_name}' as catalog.schema.table.",
         )
     return parts[0]
 
@@ -495,10 +553,12 @@ def _qualify_joined_computed_dimensions(
                 continue
             replacement = _qualify_bare_columns(original_expression, qualifier)
             if replacement is None:
-                raise ConversionError(
-                    f"[field '{field_name}'] expression on dataset '{dataset_name}' "
-                    "cannot be safely qualified; refusing to return a publishable "
-                    "Metric View artifact"
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                    f"dimension '{field_name}' of cube '{dataset_name}' uses a subquery, a "
+                    "lambda or SQL whose columns the bridge cannot qualify safely",
+                    f"Compute dimension '{field_name}' in the sql of cube '{dataset_name}' and "
+                    "read the result as a column, or leave the dimension out of the view.",
                 )
             dimension["expr"] = replacement
             changed = True
@@ -553,9 +613,12 @@ def _dataset_qualifiers(model: dict, source: str) -> dict[str, str]:
                 suffix += 1
             normalized_alias = alias.casefold()
             if normalized_alias in used_normalized_aliases:
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.MEMBER_NAME_CONFLICT,
                     f"Databricks join alias '{alias}' collides case-insensitively with "
-                    "another join alias or the reserved 'source' alias"
+                    "another join alias or the reserved 'source' alias",
+                    f"Rename the cube or join behind alias '{alias}' so it differs, ignoring case, "
+                    "from the other joins and from 'source'.",
                 )
             used_aliases.add(alias)
             used_normalized_aliases.add(normalized_alias)
@@ -580,7 +643,11 @@ def _apply_expression_templates(
     qualifiers = _dataset_qualifiers(model, source)
     metric_view = load_databricks_yaml(metric_view_yaml)
     if not isinstance(metric_view, dict):
-        raise ConversionError("Databricks converter returned a non-mapping Metric View")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            "Databricks converter returned a non-mapping Metric View",
+            REPORT_FIX,
+        )
     marker_paths = {}
     for dataset, marker in dataset_markers.items():
         if dataset == source:
@@ -588,8 +655,10 @@ def _apply_expression_templates(
         elif dataset in qualifiers:
             marker_paths[marker.casefold()] = tuple(qualifiers[dataset].split("."))
         else:
-            raise ConversionError(
-                f"dataset '{dataset}' has no emitted Metric View join path from source '{source}'"
+            raise Refusal(
+                RefusalCode.VIEW_PROJECTION_FAILED,
+                f"dataset '{dataset}' has no emitted Metric View join path from source '{source}'",
+                REPORT_FIX,
             )
 
     corpus = "\n".join([metric_view_yaml, *templates["measures"].values()]).casefold()
@@ -598,7 +667,7 @@ def _apply_expression_templates(
         outer_prefix = "_" + outer_prefix
     outer_columns = {}
     one_to_many = _one_to_many_join_paths(metric_view.get("joins"))
-    for collection, kind in (("measures", "metric"), ("dimensions", "dimension")):
+    for collection, kind in (("measures", "measure"), ("dimensions", "dimension")):
         items = {
             str(item.get("name", "")).casefold(): item
             for item in metric_view.get(collection) or []
@@ -607,8 +676,10 @@ def _apply_expression_templates(
         for name, template in templates[collection].items():
             item = items.get(name.casefold())
             if item is None or not isinstance(item.get("expr"), str):
-                raise ConversionError(
-                    f"Databricks converter dropped selected {kind} '{name}'; refusing publication"
+                raise Refusal(
+                    RefusalCode.MEMBER_UNSUPPORTED,
+                    f"Databricks converter dropped selected {kind} '{name}'; refusing publication",
+                    leave_out(f"{kind} '{name}'"),
                 )
             if collection == "dimensions":
                 for marker, path in marker_paths.items():
@@ -617,21 +688,25 @@ def _apply_expression_templates(
                         template,
                         re.IGNORECASE,
                     ):
-                        raise ConversionError(
+                        raise Refusal(
+                            RefusalCode.VIEW_JOIN_NOT_REPRESENTABLE,
                             f"dimension '{name}' reads join '{'.'.join(path)}', which is "
                             "one-to-many; a Metric View dimension must have one value per "
-                            "source row"
+                            "source row",
+                            f"Leave dimension '{name}' out of the view, or publish it from a "
+                            "view rooted at the cube that join reaches.",
                         )
             item["expr"] = _render_metric_template(
                 template, marker_paths, f"{kind} '{name}'", outer_columns, outer_prefix
             )
             column = _unaggregated_column(item["expr"]) if collection == "measures" else None
             if column is not None:
-                raise ConversionError(
-                    f"measure '{name}' reads {column} outside an aggregate, which Cube "
-                    "computes only when that column is grouped by and a Metric View "
-                    "measure cannot read; move the condition inside the aggregate, or "
-                    "leave the measure out of the view"
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                    f"measure '{name}' reads {column} outside an aggregate, which Cube computes "
+                    "only when that column is grouped by and a Metric View measure cannot read",
+                    f"Move the condition on {column} inside the aggregate of measure '{name}', or "
+                    "leave the measure out of the view.",
                 )
     if outer_columns:
         columns = ", ".join(f"{column} AS {name}" for column, name in outer_columns.items())
@@ -679,9 +754,11 @@ def _order_shadowing_dimensions(metric_view_yaml):
         )
         if ready is None:
             names = ", ".join(f"'{item['name']}'" for item in pending)
-            raise ConversionError(
-                f"dimensions {names} each read another's name, which Databricks binds to "
-                "that dimension in a Metric View whatever their order; rename one in the view"
+            raise Refusal(
+                RefusalCode.MEMBER_NAME_CONFLICT,
+                f"dimensions {names} each read another's name, which Databricks binds to that "
+                "dimension in a Metric View whatever their order",
+                "Give one of them another name in the view with an alias.",
             )
         ordered.append(ready)
         pending.remove(ready)
@@ -710,8 +787,10 @@ def _parse_rendered(expression, kind):
     try:
         return parse_one(str(expression), read="databricks")
     except SqlglotError as error:
-        raise ConversionError(
-            f"{kind} expression cannot be safely parsed for publication: {error}"
+        raise Refusal(
+            RefusalCode.MEMBER_SQL_UNSUPPORTED,
+            f"{kind} expression cannot be safely parsed for publication: {error}",
+            f"Rewrite the {kind} in SQL Databricks can parse, or leave it out of the view.",
         ) from error
 
 
@@ -764,9 +843,11 @@ def _render_metric_template(expression, marker_paths, scope, outer_columns=None,
         tokens = Dialect.get_or_raise("databricks").tokenize(expression)
         tree = parse_one(expression, read="databricks")
         if tree is None or any(token.token_type is TokenType.ARROW for token in tokens):
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.MEMBER_SQL_UNSUPPORTED,
                 f"{scope} contains nested SQL bindings whose dataset "
-                "provenance cannot be safely rendered"
+                "provenance cannot be safely rendered",
+                f"Rewrite the SQL of {scope} without nested SQL references.",
             )
         edits = []
         for column in tree.find_all(exp.Column):
@@ -780,22 +861,29 @@ def _render_metric_template(expression, marker_paths, scope, outer_columns=None,
                         isinstance(part, exp.Identifier) and part.name.casefold() in marker_paths
                         for part in column.parts
                     ):
-                        raise ConversionError(
-                            f"{scope} contains a column path that cannot be safely rendered"
+                        raise Refusal(
+                            RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                            f"{scope} contains a column path that cannot be safely rendered",
+                            f"Write each column in {scope} as {{cube}}.column.",
                         )
                     continue
                 if path != ("source",) or outer_columns is None:
-                    raise ConversionError(
-                        f"{scope} reads join '{'.'.join(path)}' inside a subquery; a "
-                        "Metric View subquery can read only the source row"
+                    raise Refusal(
+                        RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                        f"{scope} reads join '{'.'.join(path)}' inside a subquery, and a Metric "
+                        "View subquery can read only the source row",
+                        f"Read only columns of the view's root cube inside that subquery in "
+                        f"{scope}.",
                     )
                 # Databricks does not resolve `source.col` inside a subquery, and a bare
                 # `col` would bind to the subquery's own table, so the outer column is
                 # exposed on the source under a unique name.
                 start, end = parts[1].meta.get("start"), parts[-1].meta.get("end")
                 if not isinstance(start, int) or not isinstance(end, int):
-                    raise ConversionError(
-                        f"{scope} contains a column whose source position cannot be determined"
+                    raise Refusal(
+                        RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                        f"{scope} contains a column whose source position cannot be determined",
+                        f"Write each column in {scope} as {{cube}}.column.",
                     )
                 name = outer_columns.setdefault(
                     expression[start : end + 1], f"{outer_prefix}{len(outer_columns)}__"
@@ -803,27 +891,35 @@ def _render_metric_template(expression, marker_paths, scope, outer_columns=None,
                 edits.append((parts[0].meta["start"], end + 1, name))
                 continue
             if target is None or len(parts) < 2:
-                raise ConversionError(
-                    f"{scope} contains a column path that cannot be safely rendered"
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                    f"{scope} contains a column path that cannot be safely rendered",
+                    f"Write each column in {scope} as {{cube}}.column.",
                 )
             path = marker_paths.get(parts[0].name.casefold())
             if path is None:
-                raise ConversionError(
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
                     f"{scope} contains an untracked physical column reference "
-                    f"'{target.sql(dialect='databricks')}'; refusing publication"
+                    f"'{target.sql(dialect='databricks')}'; refusing publication",
+                    f"Write that column in {scope} as {{cube}}.column for a cube the view reaches.",
                 )
             start = parts[0].meta.get("start")
             next_start = parts[1].meta.get("start")
             if not isinstance(start, int) or not isinstance(next_start, int):
-                raise ConversionError(
-                    f"{scope} contains a column whose source position cannot be determined"
+                raise Refusal(
+                    RefusalCode.MEMBER_SQL_UNSUPPORTED,
+                    f"{scope} contains a column whose source position cannot be determined",
+                    f"Write each column in {scope} as {{cube}}.column.",
                 )
             rendered_path = _render_identifier_path(path)
             edits.append((start, next_start, f"{rendered_path}." if rendered_path else ""))
         return _apply_text_edits(expression, edits)
     except SqlglotError as error:
-        raise ConversionError(
-            f"{scope} cannot be safely parsed for publication: {error}"
+        raise Refusal(
+            RefusalCode.MEMBER_SQL_UNSUPPORTED,
+            f"{scope} cannot be safely parsed for publication: {error}",
+            f"Rewrite the SQL of {scope} in syntax Databricks can parse.",
         ) from error
 
 
@@ -831,7 +927,11 @@ def _validate_public_surface(ossie_yaml, metric_view_yaml):
     model = yaml.safe_load(ossie_yaml)["semantic_model"][0]
     metric_view = load_databricks_yaml(metric_view_yaml)
     if not isinstance(metric_view, dict):
-        raise ConversionError("Databricks converter returned a non-mapping Metric View")
+        raise Refusal(
+            RefusalCode.VIEW_PROJECTION_FAILED,
+            "Databricks converter returned a non-mapping Metric View",
+            REPORT_FIX,
+        )
 
     expected_dimensions = [
         field["name"]
@@ -851,9 +951,11 @@ def _validate_public_surface(ossie_yaml, metric_view_yaml):
         if expected_normalized != actual_normalized or len(expected) != len(actual):
             missing = sorted(expected_normalized - actual_normalized)
             unexpected = sorted(actual_normalized - expected_normalized)
-            raise ConversionError(
+            raise Refusal(
+                RefusalCode.VIEW_PROJECTION_FAILED,
                 f"Databricks conversion changed the selected public {kind} surface "
-                f"(missing={missing}, unexpected={unexpected}); refusing publication"
+                f"(missing={missing}, unexpected={unexpected}); refusing publication",
+                REPORT_FIX,
             )
 
 
