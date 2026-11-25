@@ -1266,6 +1266,252 @@ def test_condition_member_reading_a_cube_outside_the_view_is_refused():
         _convert(model)
 
 
+_THIRD_CUBE_MODEL = """
+cubes:
+  - name: deals
+    sql_table: main.sales.deals
+    joins:
+      - name: accounts
+        relationship: many_to_one
+        sql: "{CUBE}.account_id = {accounts}.id"
+      - name: plans
+        relationship: many_to_one
+        sql: "{accounts}.plan = {plans}.plan_name"
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: region, sql: region, type: string}
+    measures:
+      - {name: deal_amount, sql: amount, type: sum}
+  - name: accounts
+    sql_table: main.sales.accounts
+    joins:
+      - name: regions
+        relationship: many_to_one
+        sql: "{CUBE}.region_id = {regions}.id"
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: plan, sql: plan, type: string}
+      - {name: region, sql: region, type: string}
+  - name: plans
+    sql_table: main.sales.plans
+    dimensions:
+      - {name: plan_name, sql: plan_name, type: string, primary_key: true}
+      - {name: list_price, sql: list_price, type: number}
+      - {name: active, sql: active, type: boolean}
+  - name: regions
+    sql_table: main.sales.regions
+    dimensions:
+      - {name: id, sql: id, type: number, primary_key: true}
+      - {name: name, sql: name, type: string}
+views:
+  - name: sales
+    cubes:
+      - {join_path: deals, includes: [deal_amount]}
+      - {join_path: deals.accounts, includes: [plan]}
+      - {join_path: deals.plans, includes: [list_price]}
+"""
+
+_THIRD_CUBE_CONDITION = '"{accounts}.plan = {plans}.plan_name"'
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        _THIRD_CUBE_CONDITION,
+        '"{accounts.plan} = {plans.plan_name}"',
+        '"accounts.plan = plans.plan_name"',
+    ],
+)
+def test_join_reading_a_third_cube_is_nested_under_that_cube(condition):
+    model = _THIRD_CUBE_MODEL.replace(_THIRD_CUBE_CONDITION, condition)
+
+    metric_view = yaml.safe_load(_convert(model).metric_view_yaml)
+
+    assert [join["name"] for join in metric_view["joins"]] == ["accounts"]
+    accounts = metric_view["joins"][0]
+    assert accounts["on"] == "source.account_id = accounts.id"
+    assert [join["name"] for join in accounts["joins"]] == ["plans"]
+    assert accounts["joins"][0]["on"] == "accounts.plan = plans.plan_name"
+    dimensions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+    assert dimensions == {"plan": "accounts.plan", "list_price": "accounts.plans.list_price"}
+    assert [item["name"] for item in metric_view["measures"]] == ["deal_amount"]
+
+
+def test_nested_join_with_an_expression_condition_reads_its_parent():
+    model = _THIRD_CUBE_MODEL.replace(
+        _THIRD_CUBE_CONDITION,
+        '"UPPER({accounts.plan}) = {plans}.plan_name AND {plans}.active = true"',
+    )
+
+    joins = _joins_by_name(yaml.safe_load(_convert(model).metric_view_yaml))
+
+    assert joins["plans"]["on"] == "UPPER(accounts.plan) = plans.plan_name AND plans.active = true"
+    assert joins["accounts"]["joins"] == [joins["plans"]]
+
+
+def test_nested_join_keeps_the_hop_to_its_parent_when_the_view_selects_none_of_it():
+    model = _THIRD_CUBE_MODEL.replace("      - {join_path: deals.accounts, includes: [plan]}\n", "")
+
+    metric_view = yaml.safe_load(_convert(model).metric_view_yaml)
+
+    assert [join["name"] for join in metric_view["joins"]] == ["accounts"]
+    assert metric_view["joins"][0]["on"] == "source.account_id = accounts.id"
+    assert metric_view["joins"][0]["joins"][0]["on"] == "accounts.plan = plans.plan_name"
+    dimensions = {item["name"]: item["expr"] for item in metric_view["dimensions"]}
+    assert dimensions == {"list_price": "accounts.plans.list_price"}
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        # Reads the declaring cube as well as the third cube.
+        '"{CUBE}.region = {accounts}.region AND {accounts}.plan = {plans}.plan_name"',
+        '"region = {accounts}.region AND {accounts}.plan = {plans}.plan_name"',
+        '"{accounts}.plan = {plans}.plan_name AND {CUBE.region} = {accounts}.region"',
+        # Reads two cubes other than the two it joins.
+        '"{accounts}.plan = {plans}.plan_name AND {regions}.name = {plans}.region"',
+        # Reads no column of the joined cube.
+        "\"{accounts}.plan = 'pro'\"",
+    ],
+)
+def test_join_reading_a_third_cube_that_cannot_nest_is_refused(condition):
+    model = _THIRD_CUBE_MODEL.replace(_THIRD_CUBE_CONDITION, condition).replace(
+        "      - {join_path: deals.accounts, includes: [plan]}\n",
+        "      - {join_path: deals.accounts, includes: [plan]}\n"
+        "      - {join_path: deals.accounts.regions, includes: [name]}\n",
+    )
+
+    with pytest.raises(ConversionError, match="reads cube '(accounts|regions)'"):
+        _convert(model)
+
+
+@pytest.mark.parametrize("joined", ["accounts", "plans"])
+def test_join_reading_a_third_cube_across_a_one_to_many_join_is_refused(joined):
+    # Nested, a one_to_many 'plans' would fan out 'accounts' rather than 'deals'.
+    model = _THIRD_CUBE_MODEL.replace(
+        f"- name: {joined}\n        relationship: many_to_one",
+        f"- name: {joined}\n        relationship: one_to_many",
+    )
+    assert "one_to_many" in model
+
+    with pytest.raises(ConversionError, match="reads cube 'accounts'"):
+        _convert(model)
+
+
+@pytest.mark.parametrize(
+    ("condition", "member"),
+    [
+        # A member of the joined cube that reads none of its columns.
+        ("{accounts}.plan = {plans.tier}", "      - {name: tier, sql: \"'pro'\", type: string}\n"),
+        # A member of the third cube that reads the declaring cube.
+        ("{accounts.deal_region} = {plans}.region", ""),
+    ],
+)
+def test_join_reading_its_own_cube_through_a_member_keeps_the_refusal(condition, member):
+    model = (
+        _THIRD_CUBE_MODEL.replace(_THIRD_CUBE_CONDITION, f'"{condition}"')
+        .replace(
+            "      - {name: active, sql: active, type: boolean}\n",
+            "      - {name: active, sql: active, type: boolean}\n" + member,
+        )
+        .replace(
+            "      - {name: region, sql: region, type: string}\n  - name: plans",
+            "      - {name: region, sql: region, type: string}\n"
+            '      - {name: deal_region, sql: "{deals.region}", type: string}\n'
+            "  - name: plans",
+        )
+    )
+    assert "deal_region" in model
+
+    with pytest.raises(ConversionError, match="join 'deals' -> 'plans' reads cube 'accounts'"):
+        _convert(model)
+
+
+def test_source_cannot_select_a_cube_only_a_nested_join_adds():
+    model = _THIRD_CUBE_MODEL.replace("      - {join_path: deals.accounts, includes: [plan]}\n", "")
+
+    with pytest.raises(ConversionError, match="source 'accounts' is not in the projected datasets"):
+        _convert(model, source="accounts")
+
+
+def test_join_reading_a_cube_its_cube_does_not_join_is_refused():
+    # 'regions' hangs under 'accounts', not under 'deals', which declares the join.
+    model = _THIRD_CUBE_MODEL.replace(
+        _THIRD_CUBE_CONDITION, '"{regions}.name = {plans}.region"'
+    ).replace(
+        "      - {join_path: deals.accounts, includes: [plan]}\n",
+        "      - {join_path: deals.accounts, includes: [plan]}\n"
+        "      - {join_path: deals.accounts.regions, includes: [name]}\n",
+    )
+
+    with pytest.raises(ConversionError, match="reads cube 'regions'"):
+        _convert(model)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "{join_path: deals.accounts.plans, includes: [active]}",
+        "{join_path: deals.accounts.plans.regions, prefix: true, includes: [name]}",
+    ],
+)
+def test_nested_join_reached_by_another_path_in_the_view_is_refused(entry):
+    model = (
+        _THIRD_CUBE_MODEL.replace(
+            "    dimensions:\n      - {name: id, sql: id, type: number, primary_key: true}\n"
+            "      - {name: plan, sql: plan, type: string}",
+            "      - name: plans\n        relationship: many_to_one\n"
+            '        sql: "{CUBE}.plan_id = {plans}.id"\n'
+            "    dimensions:\n      - {name: id, sql: id, type: number, primary_key: true}\n"
+            "      - {name: plan, sql: plan, type: string}",
+        )
+        .replace(
+            "  - name: plans\n    sql_table: main.sales.plans\n",
+            "  - name: plans\n    sql_table: main.sales.plans\n    joins:\n"
+            '      - {name: regions, relationship: many_to_one, sql: "{CUBE}.region_id = {regions}.id"}\n',
+        )
+        .replace(
+            "      - {join_path: deals.plans, includes: [list_price]}\n",
+            f"      - {{join_path: deals.plans, includes: [list_price]}}\n      - {entry}\n",
+        )
+    )
+    assert model.count("- name: plans\n        relationship: many_to_one") == 2
+
+    with pytest.raises(
+        ConversionError,
+        match=r"'plans' is reached through join paths 'deals\.plans' and "
+        r"'deals\.accounts\.plans'",
+    ):
+        _convert(model)
+
+
+def test_nested_join_reached_by_another_path_through_a_member_is_refused():
+    model = (
+        _THIRD_CUBE_MODEL.replace(
+            "    dimensions:\n      - {name: id, sql: id, type: number, primary_key: true}\n"
+            "      - {name: plan, sql: plan, type: string}",
+            "      - name: plans\n        relationship: many_to_one\n"
+            '        sql: "{CUBE}.plan_id = {plans}.id"\n'
+            "    dimensions:\n      - {name: id, sql: id, type: number, primary_key: true}\n"
+            "      - {name: plan, sql: plan, type: string}",
+        )
+        .replace(
+            "      - {name: region, sql: region, type: string}\n    measures:",
+            "      - {name: region, sql: region, type: string}\n"
+            '      - {name: account_plan_active, sql: "{CUBE.accounts.plans.active}", type: boolean}\n'
+            "    measures:",
+        )
+        .replace("includes: [deal_amount]", "includes: [deal_amount, account_plan_active]")
+    )
+
+    with pytest.raises(
+        ConversionError,
+        match=r"join path 'deals\.accounts\.plans', which the view's joins do not follow; "
+        r"they reach 'plans' through 'deals\.plans'",
+    ):
+        _convert(model)
+
+
 _JOINED_DIMENSION_MODEL = """
 cubes:
   - name: orders
